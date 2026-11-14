@@ -27,4 +27,28 @@ class TestTask(TestCase):
         )
         self.assertIsInstance(model, GPT2Backbone)
 
-    # TODO: compare numerics with huggingface model
+    def test_reference_parity(self):
+        self.run_reference_parity_test(
+            model_type="gpt2",
+            reference_class="GPT2LMHeadModel",
+            config={
+                "vocab_size": 211,
+                "n_positions": 64,
+                "n_embd": 48,
+                "n_layer": 3,
+                "n_head": 4,
+                # One id for both, as in GPT-2; the default is outside this
+                # vocabulary.
+                "bos_token_id": 1,
+                "eos_token_id": 1,
+            },
+            backbone_cls=GPT2Backbone,
+            task_cls=GPT2CausalLM,
+            known_failures={
+                "epsilon": (
+                    "convert_gpt2 does not map `layer_norm_epsilon`, and "
+                    "GPT2Backbone hard-codes 1e-5.",
+                    24,
+                ),
+            },
+        )

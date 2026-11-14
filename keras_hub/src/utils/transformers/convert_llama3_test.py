@@ -63,4 +63,26 @@ class TestTask(TestCase):
         )
         self.assertEqual(keras_config["rope_max_wavelength"], 20000.0)
 
-    # TODO: compare numerics with huggingface model
+    def test_reference_parity(self):
+        self.run_reference_parity_test(
+            model_type="llama",
+            reference_class="LlamaForCausalLM",
+            config={
+                "vocab_size": 211,
+                "hidden_size": 72,
+                "intermediate_size": 100,
+                "num_hidden_layers": 3,
+                "num_attention_heads": 6,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 64,
+            },
+            backbone_cls=Llama3Backbone,
+            task_cls=Llama3CausalLM,
+            known_failures={
+                "epsilon": (
+                    "convert_llama3 does not map `rms_norm_eps`, so "
+                    "Llama3Backbone keeps its 1e-6 default.",
+                    280,
+                ),
+            },
+        )

@@ -1361,6 +1361,128 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
             output = ops.argmax(output, axis=-1)
             self.assertAllEqual(output, expected_labels)
 
+    def run_reference_parity_test(
+        self,
+        model_type,
+        reference_class,
+        config,
+        backbone_cls,
+        task_cls=None,
+        ignored_reference_tensors=None,
+        derived_weights=None,
+        known_failures=None,
+    ):
+        """Check a transformers converter against the transformers model.
+
+        A tiny `reference_class` model is built from `config`, its weights
+        are redrawn twice ("revealing" and "low_variance"), and each
+        checkpoint written by `save_pretrained` is loaded with `from_preset`
+        on the CPU. If the config has normalization epsilon fields, the
+        "epsilon" check loads the low_variance weights again, once for each
+        value of `reference_parity.EPSILONS`, to which the helper sets every
+        such field. The test checks that:
+
+        - `from_preset` succeeds and returns `backbone_cls` (and `task_cls`,
+          if given);
+        - the converter reads every stored tensor and assigns every Keras
+          weight, except those named in `ignored_reference_tensors` and
+          `derived_weights`;
+        - for each of `revealing`, `low_variance` and `epsilon` (at each of
+          its values), every output (hidden states, pooled output, and the
+          logits of `task_cls`) differs from transformers by at most
+          `reference_parity.PARITY_THRESHOLD` times the root mean square of
+          the transformers output, at every valid position.
+
+        A negative control and a second load without the audit check the
+        test itself. Only the three parity checks can be known failures. If
+        every failure is a known failure within its `max_error`, the test
+        shows as XFAIL; a known failure that no longer happens, or that
+        measures above its `max_error` or far below it, fails the test.
+
+        Args:
+            model_type: string. The `model_type` keras-hub dispatches on.
+            reference_class: string. The transformers class to save, e.g.
+                `"GPT2LMHeadModel"`.
+            config: dict. Small values for the shape, token id and
+                structural fields of the reference config. Other fields,
+                epsilons included, are rejected; see
+                `reference_parity.CONFIG_FIELDS`.
+            backbone_cls: The keras-hub backbone class the load must return.
+            task_cls: Optional keras-hub task class to load through, whose
+                logits are then compared too.
+            ignored_reference_tensors: Optional dict from an fnmatch pattern
+                on stored tensor keys to the reason they are not read. Each
+                pattern must match only tensors that are not read.
+            derived_weights: Optional dict from an fnmatch pattern on Keras
+                weight paths to the reason they are not assigned: weights
+                that the model computes from its config instead of loading.
+                Each pattern must match only weights that are not assigned.
+            known_failures: Optional dict from `"revealing"`,
+                `"low_variance"` or `"epsilon"` to a tuple `(reason,
+                max_error)`: what is wrong today (and the issue, once
+                filed), and the largest error the check may reach, about
+                twice what it measures. The check then cannot see a smaller
+                defect, so test a code path that fails in a test method of
+                its own.
+        """
+        import pytest
+
+        if keras.config.backend() == "openvino":
+            self.skipTest("Reference parity tests do not run on OpenVINO.")
+        for module in ("torch", "transformers", "safetensors"):
+            pytest.importorskip(module)
+        from keras_hub.src.tests import reference_parity
+
+        ignored_reference_tensors = ignored_reference_tensors or {}
+        derived_weights = derived_weights or {}
+        known_failures = known_failures or {}
+        header = (
+            f"Reference parity of model_type `{model_type}` "
+            f"({reference_class} against "
+            f"{(task_cls or backbone_cls).__name__}):"
+        )
+        problems = reference_parity.check_config(reference_class, config)
+        problems += reference_parity.check_reasons(
+            "ignored_reference_tensors", ignored_reference_tensors
+        )
+        problems += reference_parity.check_reasons(
+            "derived_weights", derived_weights
+        )
+        problems += reference_parity.check_known_failures(known_failures)
+        if problems:
+            self.fail("\n".join([header] + problems))
+
+        with tempfile.TemporaryDirectory() as directory:
+            problems, comparisons, notes, fields = reference_parity.run_checks(
+                model_type,
+                reference_class,
+                config,
+                backbone_cls,
+                task_cls,
+                ignored_reference_tensors,
+                derived_weights,
+                directory,
+            )
+        failures, expected = reference_parity.apply_known_failures(
+            comparisons, known_failures, fields
+        )
+        measured = []
+        if notes:
+            measured = ["Measured:"] + [f"  {note}" for note in notes]
+        if problems or failures:
+            lines = [header] + problems + failures
+            if expected:
+                lines += ["Known failures that still fail:"] + expected
+            self.fail("\n".join(lines + measured))
+        if expected:
+            message = "\n".join(
+                [f"{header} known failures:"] + expected + measured
+            )
+            pytest.xfail(message)
+            # Reached under `pytest --runxfail`, which shows known failures
+            # as failures.
+            self.fail(message)
+
     def get_test_data_dir(self):
         return str(pathlib.Path(__file__).parent / "test_data")
 

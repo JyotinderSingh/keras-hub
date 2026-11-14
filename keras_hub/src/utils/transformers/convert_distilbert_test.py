@@ -34,4 +34,24 @@ class TestTask(TestCase):
         )
         self.assertIsInstance(model, DistilBertBackbone)
 
-    # TODO: compare numerics with huggingface model
+    def test_reference_parity(self):
+        self.run_reference_parity_test(
+            model_type="distilbert",
+            reference_class="DistilBertForMaskedLM",
+            config={
+                "vocab_size": 211,
+                "dim": 48,
+                "n_layers": 3,
+                "n_heads": 4,
+                "hidden_dim": 80,
+                "max_position_embeddings": 64,
+                "pad_token_id": 0,
+            },
+            backbone_cls=DistilBertBackbone,
+            ignored_reference_tensors={
+                "vocab_*": (
+                    "The masked-LM head of DistilBertForMaskedLM; "
+                    "DistilBertBackbone has no head."
+                ),
+            },
+        )

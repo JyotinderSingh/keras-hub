@@ -564,3 +564,28 @@ class TestConvertModernBert(TestCase):
             self.assertAllClose(
                 hf_embeddings, keras_embeddings, atol=tol, rtol=tol
             )
+
+    def test_reference_parity(self):
+        self.run_reference_parity_test(
+            model_type="modernbert",
+            reference_class="ModernBertModel",
+            config={
+                "vocab_size": 211,
+                "hidden_size": 48,
+                "intermediate_size": 80,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "max_position_embeddings": 64,
+                "local_attention": 8,
+                # Set, so that it is saved: otherwise the config holds only
+                # `layer_types`, which convert_modern_bert does not read, and
+                # the load fails.
+                "global_attn_every_n_layers": 2,
+                "pad_token_id": 0,
+                "cls_token_id": 1,
+                "sep_token_id": 2,
+                "bos_token_id": 1,
+                "eos_token_id": 2,
+            },
+            backbone_cls=ModernBertBackbone,
+        )

@@ -36,6 +36,7 @@ Keep this checklist handy!
 
 - [ ] An `xx/xx_presets.py` file with links to weights uploaded to a personal GCP bucket/Google Drive \[[Example](https://github.com/keras-team/keras-hub/blob/master/keras_hub/src/models/distil_bert/distil_bert_presets.py)\].
 - [ ] A `tools/checkpoint_conversion/convert_xx_checkpoints.py` which is reusable script for converting checkpoints \[[Example](https://github.com/keras-team/keras-hub/blob/master/tools/checkpoint_conversion/convert_distilbert_checkpoints.py)\].
+- [ ] If the model loads transformers checkpoints, a `test_reference_parity` method in `keras_hub/src/utils/transformers/convert_xx_test.py`, or an entry in `NOT_YET_COVERED` for a model with other than text inputs \[[Guide](#reference-parity-test)\].
 - [ ] A Colab notebook link in the PR description, showing an end-to-end task such as text classification, etc. The task model can be built using the backbone model, with the task head on top \[[Example](https://gist.github.com/mattdangerw/bf0ca07fb66b6738150c8b56ee5bab4e)\].
 
 ### Step 5: PR #4 and Beyond - Add XX Tasks and Preprocessors
@@ -232,6 +233,132 @@ proto file, and we had to make some modifications [here](https://github.com/kera
 a separate preprocessor class for every task. This is because different tasks
 might require different input formats. For instance, we have a [separate preprocessor](https://github.com/keras-team/keras-hub/blob/master/keras_hub/src/models/distil_bert/distil_bert_masked_lm_preprocessor.py)
 for masked language modeling (MLM) for DistilBERT.
+
+## Reference parity test
+
+Every converter in `keras_hub/src/utils/transformers/` (the code that lets
+`from_preset("hf://...")` load a transformers checkpoint) needs a reference
+parity test: a `test_reference_parity` method in the converter's test file,
+`convert_xx_test.py`. It needs no download and runs on every pull request and
+every backend (OpenVINO skips it), so it takes no decorator such as
+`@pytest.mark.large`, its file sets no `pytestmark`, and it does not skip
+itself.
+
+The helper feeds text inputs only: token ids, a padding mask and, where the
+backbone takes them, segment ids. The converter of a vision, audio,
+multimodal or encoder-decoder model has no parity test yet: list its
+`model_type` in `NOT_YET_COVERED` of `reference_parity_coverage_test.py`
+with the reason.
+
+```python
+def test_reference_parity(self):
+    self.run_reference_parity_test(
+        model_type="distilbert",
+        reference_class="DistilBertForMaskedLM",
+        config={
+            "vocab_size": 211,
+            "dim": 48,
+            "n_layers": 3,
+            "n_heads": 4,
+            "hidden_dim": 80,
+            "max_position_embeddings": 64,
+            "pad_token_id": 0,
+        },
+        backbone_cls=DistilBertBackbone,
+        ignored_reference_tensors={
+            "vocab_*": (
+                "The masked-LM head of DistilBertForMaskedLM; "
+                "DistilBertBackbone has no head."
+            ),
+        },
+    )
+```
+
+The helper builds a tiny `reference_class` model from `config`, saves it with
+`save_pretrained`, loads it with `from_preset` (through `task_cls` if given,
+otherwise `backbone_cls`) and checks that:
+
+- the load succeeds and returns `backbone_cls` (and `task_cls`);
+- the converter reads every stored tensor and assigns every Keras weight;
+- the hidden states, and the pooled output and logits where the models have
+  them, match transformers at every valid position to within `1e-4` times
+  the root mean square of the transformers output there, in three checks:
+  `revealing` draws random weights that expose swapped or transposed
+  tensors, `low_variance` draws small weights that expose a wrong
+  normalization epsilon, and `epsilon` takes the small weights again with
+  every normalization epsilon field of the config (such as `rms_norm_eps`)
+  set by the helper to `3e-4`, then to `3e-3`, which exposes an epsilon that
+  the converter does not map or that the backbone hard-codes. Each value
+  exposes cases that the other misses, and the check takes the larger error.
+
+It also checks itself: corrupting the embedding table must change the
+outputs, and a second load without its audit must give the same outputs.
+
+What a test may set, besides the classes and `model_type` (a string literal,
+the `model_type` the converter is dispatched on):
+
+- `config`: small shape fields (vocabulary, width, layers, heads, positions,
+  feed-forward sizes), special token ids and a few structural fields (such as
+  the number of experts). Each shape and structural field must differ from
+  the transformers default, and `head_dim` from
+  `hidden_size // num_attention_heads`, to show that the converter reads it.
+  Where the config has `num_key_value_heads`, it must be more than
+  1 and less than `num_attention_heads`, so that grouped-query attention
+  runs, and an attention window must be shorter than the inputs (17 tokens).
+  These rules also hold for the values that the config class derives from
+  the fields set. Pick structural values that make every code path run.
+  Epsilon fields belong to the helper and are rejected. Any other field,
+  such as an activation or a dropout, is rejected too; ask a maintainer to
+  classify it. Such fields, a RoPE base among them, are tested only at
+  their transformers defaults.
+- `ignored_reference_tensors`: stored tensors the converter does not read,
+  such as a head the Keras model does not have, each with the reason (what
+  is wrong, if it is a defect). A pattern must match only unread tensors.
+- `derived_weights`: Keras weights that the model computes from its config
+  instead of loading, such as the RoPE `inv_freq` of SmolLM3, each with the
+  reason. A pattern must match only unassigned weights.
+
+`known_failures` records a known numerical difference from transformers in
+the `revealing`, `low_variance` or `epsilon` check. A new converter should
+not need it.
+
+- Format: `{check: (reason, max_error)}`. The reason states what is wrong in
+  one short sentence that names the file or field, and once an issue is
+  filed, links it. `max_error` is about twice the error the check measures
+  today on all three backends.
+- Strictness: the test shows as XFAIL while the error stays within
+  `max_error`, and the short test summary at the end of the pytest output
+  prints the reasons and the measured values.
+  It fails when the error rises above `max_error`, drops below a tenth of
+  it, or is gone, so the entry is updated or removed with the fix. A partial
+  fix can leave the entry in place with a reason that is no longer true, so
+  whoever fixes part of a defect updates its reason and `max_error`.
+- Blind spot: a known failure hides every defect smaller than itself. While
+  keras-hub's RoBERTa leaves out the token type embedding (an error of about
+  4), its parity checks cannot detect a wiring bug at all. So when a config
+  field selects the code path that fails, keep the main test on a config
+  that avoids that path, and test the path in a method of its own that
+  carries the known failure, as `test_reference_parity_gemma2_query_scale`
+  does.
+- A model whose checkpoint does not load has no parity test yet: list it in
+  `NOT_YET_COVERED` with the reason.
+
+Fix the converter when the test fails; do not loosen the helper, its bounds or
+its threshold. Start from the test of a similar family, run it once, and take
+tensor and weight names from the failure message.
+
+`reference_parity_coverage_test.py` fails when a dispatch key of
+`preset_loader.py` has no parity test and is not listed in `NOT_YET_COVERED`
+with the reason, and library code must not import `transformers`
+(`keras_hub/src/tests/transformers_import_test.py`). Run the test on all
+three backends; it is skipped if torch, transformers or safetensors is
+missing:
+
+```shell
+for backend in jax tensorflow torch; do
+    KERAS_BACKEND=$backend pytest keras_hub/src/utils/transformers/convert_xx_test.py -k reference_parity
+done
+```
 
 ## Conclusion
 
