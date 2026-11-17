@@ -1,16 +1,20 @@
 import importlib
 import os
 import tempfile
+import traceback
 from unittest import mock
 
 import numpy as np
 import pytest
+from keras.src.backend.common.variables import Variable
 
 from keras_hub.src.models.gpt2.gpt2_backbone import GPT2Backbone
 from keras_hub.src.models.gpt2.gpt2_causal_lm import GPT2CausalLM
 from keras_hub.src.tests import reference_parity
 from keras_hub.src.tests.test_case import TestCase
 from keras_hub.src.utils.transformers import convert_gpt2
+from keras_hub.src.utils.transformers import preset_loader
+from keras_hub.src.utils.transformers import safetensor_utils
 
 GPT2_CONFIG = {
     "vocab_size": 211,
@@ -449,6 +453,17 @@ class ReferenceParityTest(TestCase):
                     "LlamaForCausalLM", config, directory
                 )
 
+    def test_check_reasons(self):
+        check = reference_parity.check_reasons
+        self.assertEqual(check("derived_weights", {"*inv_freq": "RoPE"}), [])
+        self.assertEqual(
+            check("derived_weights", {"*inv_freq": None, "*bias": " "}),
+            [
+                "`derived_weights`: `*inv_freq` needs a non-empty reason.",
+                "`derived_weights`: `*bias` needs a non-empty reason.",
+            ],
+        )
+
     def test_check_known_failures(self):
         check = reference_parity.check_known_failures
         known = {"revealing": (MISTRAL_FLOAT16, 3e-4)}
@@ -467,6 +482,26 @@ class ReferenceParityTest(TestCase):
         self.assertLen(check({"revealing": (" ", 1e-2)}), 1)
         # `max_error` must be above the threshold.
         self.assertLen(check({"revealing": (MISTRAL_FLOAT16, 1e-4)}), 1)
+
+    def test_check_patterns(self):
+        names = ["h.0.weight", "h.0.bias", "lm_head.weight", "lm_head.bias"]
+        unread = ["lm_head.weight", "lm_head.bias"]
+        nouns = ("unread tensor", "read")
+        check = reference_parity.check_patterns
+        self.assertEqual(
+            check("ignored", ["lm_head.*"], names, unread, nouns), []
+        )
+        self.assertEqual(
+            check(
+                "ignored", ["pooler.*", "h.0.*", "*[!s]"], names, unread, nouns
+            ),
+            [
+                "`ignored`: `pooler.*` matches no unread tensor; remove it.",
+                "`ignored`: `h.0.*` matches no unread tensor; remove it.",
+                "`ignored`: `*[!s]` also matches `h.0.weight`, which the "
+                "converter read; make it specific.",
+            ],
+        )
 
     def test_apply_known_failures(self):
         def apply(known_failures, **errors):
@@ -597,8 +632,71 @@ class ReferenceParityTest(TestCase):
                 )
         run_checks.assert_not_called()
 
+    def test_check_audit(self):
+        stored = [
+            ("model.safetensors", key)
+            for key in ("a.weight", "b.weight", "head.weight")
+        ]
+        audit = mock.Mock(
+            reads={("model.safetensors", "a.weight")},
+            failed_reads=[("model.safetensors", "a.gamma")],
+            converter="convert_x",
+        )
+        weights = [
+            mock.Mock(path=path, shape=(2,))
+            for path in ("a/kernel", "b/kernel", "rope/inv_freq")
+        ]
+        census = {
+            "never_assigned": weights[1:],
+            "outside_phases": [],
+            "nan_left": [],
+        }
+        problems = reference_parity.check_audit(
+            audit,
+            census,
+            stored,
+            weights,
+            {"head.*": "A head."},
+            {"rope/*": "Computed."},
+        )
+        # A failed read, such as a probe for another name, is no problem.
+        self.assertEqual(
+            problems,
+            [
+                "unread: 1 of 3 stored tensors were never read by "
+                "`convert_x`:\n    b.weight\n  Port them, or list them in "
+                "`ignored_reference_tensors` with the reason.",
+                "unassigned: 1 of 3 Keras weights were never assigned by the "
+                "converter:\n    b/kernel (2,)\n  Port them. A weight that "
+                "the model computes from its config instead of loading goes "
+                "in `derived_weights`, with the reason.",
+            ],
+        )
+
+    def test_describe_weights(self):
+        weights = [
+            mock.Mock(path="rotary_emb/inv_freq", shape=(6,)),
+            mock.Mock(path="dense/kernel", shape=(4, 4)),
+            mock.Mock(path="rotary_emb/inv_freq", shape=(6,)),
+        ]
+        # A repeated path gets the index of the weight.
+        self.assertEqual(
+            reference_parity.describe_weights(weights[1:], weights),
+            ["dense/kernel (4, 4)", "rotary_emb/inv_freq (6,) (weights[2])"],
+        )
+
     def test_describe_load_failure(self):
         pytest.importorskip("transformers")
+        note = "NaN in the message is the audit's placeholder"
+        for message, has_note in (
+            ("Got nan in the weights", True),
+            ("NaN values", True),
+            ("Down for maintenance", False),
+        ):
+            description = reference_parity.describe_load_failure(
+                "Backbone.from_preset", ValueError(message)
+            )
+            self.assertEqual(note in description, has_note, message)
 
         def convert_weights():
             raise KeyError("h.0.attn.c_attn.weight")
@@ -616,7 +714,47 @@ class ReferenceParityTest(TestCase):
             'in convert_weights\n    raise KeyError("h.0', description
         )
 
-    def test_errors_of_the_load(self):
+    def test_check_uninstrumented_names_suspects(self):
+        error = RuntimeError("A weight has no value.")
+        with mock.patch.object(
+            reference_parity, "load_model", side_effect=error
+        ):
+            problems = reference_parity.check_uninstrumented(
+                "unused",
+                None,
+                outputs={},
+                inputs={},
+                suspects=["inv_freq (6,)"],
+            )
+        self.assertLen(problems, 1)
+        self.assertIn("RuntimeError: A weight has no value.", problems[0])
+        self.assertIn("so look at them first:\n    inv_freq (6,)", problems[0])
+
+    def test_load_audit_restores_patches(self):
+        def patched():
+            return (
+                safetensor_utils.safetensors,
+                preset_loader.TransformersPresetLoader.__init__,
+            )
+
+        originals = patched()
+        assign = Variable.assign
+        with self.assertRaises(ValueError):
+            with reference_parity.LoadAudit():
+                for value, original in zip(patched(), originals):
+                    self.assertIsNot(value, original)
+                raise ValueError()
+        self.assertEqual(patched(), originals)
+        self.assertIs(Variable.assign, assign)
+        # A patch that fails, as after a rename in keras-hub, undoes those
+        # made before it.
+        with mock.patch.object(preset_loader, "TransformersPresetLoader", None):
+            with self.assertRaises(AttributeError):
+                with reference_parity.LoadAudit():
+                    pass
+        self.assertEqual(patched(), originals)
+
+    def test_errors_of_the_load_and_of_the_audit(self):
         for module in ("torch", "transformers", "safetensors"):
             pytest.importorskip(module)
         arguments = {
@@ -640,3 +778,27 @@ class ReferenceParityTest(TestCase):
                 r"'h.0.attn.c_attn.weight'\n(.*\n)*.*in convert_weights",
             ):
                 self.run_reference_parity_test(**arguments)
+
+        # A bug in the audit is not; it fails with its own traceback, also
+        # when it raises inside `from_preset`.
+        def snapshot(audit, weights):
+            raise RuntimeError("bug in LoadAudit._snapshot")
+
+        with mock.patch.object(
+            reference_parity.LoadAudit, "_snapshot", snapshot
+        ):
+            try:
+                self.run_reference_parity_test(**arguments)
+            except RuntimeError as e:
+                frames = traceback.extract_tb(e.__traceback__)
+            else:
+                self.fail("The bug in the audit was not raised.")
+        # The traceback goes down to the frame that raised.
+        self.assertEqual(frames[-1].name, "snapshot")
+        for method in ("phase", "finish"):
+            error = RuntimeError(f"bug in LoadAudit.{method}")
+            with mock.patch.object(
+                reference_parity.LoadAudit, method, side_effect=error
+            ):
+                with self.assertRaisesRegex(RuntimeError, "bug in LoadAudit"):
+                    self.run_reference_parity_test(**arguments)

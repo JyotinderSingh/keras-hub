@@ -1368,6 +1368,8 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
         config,
         backbone_cls,
         task_cls=None,
+        ignored_reference_tensors=None,
+        derived_weights=None,
         known_failures=None,
     ):
         """Check a transformers converter against the transformers model.
@@ -1379,13 +1381,16 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
 
         - `from_preset` succeeds and returns `backbone_cls` (and `task_cls`,
           if given);
+        - the converter reads every stored tensor and assigns every Keras
+          weight, except those named in `ignored_reference_tensors` and
+          `derived_weights`;
         - every output (hidden states, pooled output, and the
           logits of `task_cls`) differs from transformers by at most
           `reference_parity.PARITY_THRESHOLD` times the root mean square of
           the transformers output, at every valid position.
 
-        A negative control checks the test itself.
-        Only the parity check can be a known failure. If
+        A negative control and a second load without the audit check the
+        test itself. Only the parity check can be a known failure. If
         every failure is a known failure within its `max_error`, the test
         shows as XFAIL; a known failure that no longer happens, or that
         measures above its `max_error` or far below it, fails the test.
@@ -1400,6 +1405,13 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
             backbone_cls: The keras-hub backbone class the load must return.
             task_cls: Optional keras-hub task class to load through, whose
                 logits are then compared too.
+            ignored_reference_tensors: Optional dict from an fnmatch pattern
+                on stored tensor keys to the reason they are not read. Each
+                pattern must match only tensors that are not read.
+            derived_weights: Optional dict from an fnmatch pattern on Keras
+                weight paths to the reason they are not assigned: weights
+                that the model computes from its config instead of loading.
+                Each pattern must match only weights that are not assigned.
             known_failures: Optional dict from `"revealing"` to a tuple
                 `(reason, max_error)`: what is wrong today (and the issue, once
                 filed), and the largest error the check may reach, about
@@ -1415,6 +1427,8 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
             pytest.importorskip(module)
         from keras_hub.src.tests import reference_parity
 
+        ignored_reference_tensors = ignored_reference_tensors or {}
+        derived_weights = derived_weights or {}
         known_failures = known_failures or {}
         header = (
             f"Reference parity of model_type `{model_type}` "
@@ -1422,6 +1436,12 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
             f"{(task_cls or backbone_cls).__name__}):"
         )
         problems = reference_parity.check_config(reference_class, config)
+        problems += reference_parity.check_reasons(
+            "ignored_reference_tensors", ignored_reference_tensors
+        )
+        problems += reference_parity.check_reasons(
+            "derived_weights", derived_weights
+        )
         problems += reference_parity.check_known_failures(known_failures)
         if problems:
             self.fail("\n".join([header] + problems))
@@ -1433,6 +1453,8 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
                 config,
                 backbone_cls,
                 task_cls,
+                ignored_reference_tensors,
+                derived_weights,
                 directory,
             )
         failures, expected = reference_parity.apply_known_failures(
