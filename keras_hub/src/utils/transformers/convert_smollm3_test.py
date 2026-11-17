@@ -63,3 +63,34 @@ class TestSmollm3Converter(TestCase):
             transformers_config
         )
         self.assertEqual(keras_config["rope_theta"], 20000.0)
+
+    def test_reference_parity(self):
+        self.run_reference_parity_test(
+            model_type="smollm3",
+            reference_class="SmolLM3ForCausalLM",
+            config={
+                "vocab_size": 211,
+                "hidden_size": 72,
+                "intermediate_size": 100,
+                # SmolLM3 skips RoPE in every fourth layer by default, so
+                # four layers cover one layer without RoPE.
+                "num_hidden_layers": 4,
+                "num_attention_heads": 6,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 64,
+                # The default special token ids are outside this vocabulary.
+                "pad_token_id": 0,
+                "bos_token_id": 1,
+                "eos_token_id": 2,
+            },
+            backbone_cls=SmolLM3Backbone,
+            task_cls=SmolLM3CausalLM,
+            derived_weights={
+                "rotary_emb/inv_freq": (
+                    "RoPE inverse frequencies, computed from `rope_theta` "
+                    "and the head size when the layer is created; "
+                    "transformers keeps them in a non-persistent buffer, so "
+                    "checkpoints do not store them."
+                ),
+            },
+        )

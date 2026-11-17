@@ -58,3 +58,23 @@ class TestMixtralConverter(TestCase):
             transformers_config
         )
         self.assertEqual(keras_config["rope_max_wavelength"], 20000.0)
+
+    def test_reference_parity(self):
+        self.run_reference_parity_test(
+            model_type="mixtral",
+            reference_class="MixtralForCausalLM",
+            config={
+                "vocab_size": 211,
+                "hidden_size": 72,
+                "intermediate_size": 100,
+                "num_hidden_layers": 3,
+                "num_attention_heads": 6,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 64,
+                "sliding_window": 8,
+                "num_local_experts": 4,
+                "num_experts_per_tok": 3,
+            },
+            backbone_cls=MixtralBackbone,
+            task_cls=MixtralCausalLM,
+        )

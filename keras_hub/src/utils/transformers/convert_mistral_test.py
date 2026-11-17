@@ -240,3 +240,30 @@ class TestTask(TestCase):
         self.assertEqual(tokenizer.vocabulary_size(), 266)
         output = tokenizer("the tin")
         self.assertEqual(tokenizer.detokenize(output), "the tin")
+
+    def test_reference_parity(self):
+        float16_cast = (
+            "convert_mistral rounds every weight to float16, so a float32 "
+            "checkpoint does not load exactly."
+        )
+        self.run_reference_parity_test(
+            model_type="mistral",
+            reference_class="MistralForCausalLM",
+            config={
+                "vocab_size": 211,
+                "hidden_size": 72,
+                "intermediate_size": 100,
+                "num_hidden_layers": 3,
+                "num_attention_heads": 6,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 64,
+                "sliding_window": 8,
+            },
+            backbone_cls=MistralBackbone,
+            task_cls=MistralCausalLM,
+            known_failures={
+                "revealing": (float16_cast, 2.2e-2),
+                "low_variance": (float16_cast, 3.3e-3),
+                "epsilon": (float16_cast, 3.5e-3),
+            },
+        )
