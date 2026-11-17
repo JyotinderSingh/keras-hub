@@ -53,17 +53,183 @@ SEQUENCE_LENGTH = 17
 MIN_TOKEN_ID = 5
 # Seeds the weight draws, the inputs and the Keras initializers.
 SEED = 0
+# Keeps a parity test cheap enough to run on every pull request.
+MAX_REFERENCE_PARAMETERS = 5_000_000
 # The `max_error` of a known failure may be at most this many times what it
 # measures, so that it stays close to the known error. A known failure still
 # hides every defect smaller than itself: give a code path that fails its own
 # test method, and keep it out of the main test.
 MAX_ERROR_SLACK = 10
 
+# Reference config fields a parity test may set, by kind. Any other field (an
+# activation, a dropout, a bias switch, a rotary base) needs a maintainer to
+# classify it first, because changing it can hide a bug.
+CONFIG_FIELDS = {
+    "vocab_size": "vocabulary",
+    "hidden_size": "width",
+    "n_embd": "width",
+    "dim": "width",
+    "embedding_size": "width",
+    "num_hidden_layers": "layers",
+    "n_layer": "layers",
+    "n_layers": "layers",
+    "num_attention_heads": "heads",
+    "n_head": "heads",
+    "n_heads": "heads",
+    "num_key_value_heads": "heads",
+    "max_position_embeddings": "positions",
+    "n_positions": "positions",
+    "intermediate_size": "size",
+    "hidden_dim": "size",
+    "head_dim": "size",
+    "moe_intermediate_size": "size",
+    "shared_expert_intermediate_size": "size",
+    "type_vocab_size": "token_types",
+    "pad_token_id": "token_id",
+    "bos_token_id": "token_id",
+    "eos_token_id": "token_id",
+    "cls_token_id": "token_id",
+    "sep_token_id": "token_id",
+    "query_pre_attn_scalar": "structural",
+    "sliding_window": "window",
+    "local_attention": "window",
+    "global_attn_every_n_layers": "structural",
+    "num_local_experts": "structural",
+    "num_experts": "structural",
+    "num_experts_per_tok": "structural",
+    "decoder_sparse_step": "structural",
+    "num_hidden_groups": "structural",
+    "inner_group_num": "structural",
+}
+# Inclusive bounds by kind of field; `None` means no bound. Six layers fit one
+# period of the longest layer pattern: Gemma 3's five sliding window layers
+# and one global layer. A size below 4, such as a head size of 1, hides
+# transposed and mis-split tensors. An attention window longer than the
+# inputs would leave the windowed attention untested.
+CONFIG_BOUNDS = {
+    "vocabulary": (32, 512),
+    "width": (16, 96),
+    "layers": (2, 6),
+    "heads": (2, None),
+    "positions": (SEQUENCE_LENGTH, 128),
+    "size": (4, None),
+    "token_id": (0, MIN_TOKEN_ID - 1),
+    "window": (2, SEQUENCE_LENGTH - 1),
+}
+# Kinds of field that may keep the reference config default. A shape or
+# structural field must differ from it, so that the test shows that the
+# converter reads it.
+DEFAULT_KINDS = ("token_id", "window")
+# Shape and structural fields that may keep their default value, with the
+# reason.
+DEFAULT_FIELDS = {
+    "type_vocab_size": (
+        "convert_bert does not map it to `num_segments`, so BERT checkpoints "
+        "load only with the default of 2 token types."
+    ),
+    "decoder_sparse_step": (
+        "convert_qwen_moe ports the weights of a dense layer to "
+        "`decoder_layer`, not to `decoder_layer.mlp`, so a checkpoint with "
+        "a dense layer does not load."
+    ),
+}
+
 STATUS_TEXT = {
     "shape": "shapes differ",
     "nonfinite_keras": "NaN or inf in the Keras output",
     "nonfinite_reference": "NaN or inf in the reference output",
 }
+
+
+def out_of_bounds(field, value):
+    """Returns why `value` is out of bounds for `field`, or `None`."""
+    kind = CONFIG_FIELDS[field]
+    low, high = CONFIG_BOUNDS.get(kind, (None, None))
+    if (low is None or value >= low) and (high is None or value <= high):
+        return None
+    bounds = f"at least {low}" if high is None else f"{low} to {high}"
+    if kind == "token_id":
+        bounds += f", as the inputs use ids from {MIN_TOKEN_ID} up"
+    return (
+        f"`{field}={value}` is out of bounds: a {kind.replace('_', ' ')} "
+        f"field must be {bounds}."
+    )
+
+
+def check_config(reference_class, config):
+    """Returns a list of problems with the reference config of a test.
+
+    The rules apply to the fields given and then to the values that the
+    reference uses, which its config class may derive from them (such as
+    `head_dim` and `num_key_value_heads`).
+    """
+    import transformers
+
+    model_class = getattr(transformers, reference_class, None)
+    if model_class is None:
+        return [f"`{reference_class}` is not a transformers class."]
+    config_class = model_class.config_class
+    defaults = config_class()
+    problems = []
+    for field, value in config.items():
+        kind = CONFIG_FIELDS.get(field)
+        if kind is None:
+            problems.append(
+                f"`{field}` is not a field a parity test may set; ask a "
+                f"maintainer to classify `{field}`."
+            )
+            continue
+        if not isinstance(value, int) or isinstance(value, bool):
+            problems.append(f"`{field}` must be an integer, got {value!r}.")
+            continue
+        problem = out_of_bounds(field, value)
+        if problem:
+            problems.append(problem)
+        if (
+            kind not in DEFAULT_KINDS
+            and field not in DEFAULT_FIELDS
+            and getattr(defaults, field, None) == value
+        ):
+            problems.append(
+                f"`{field}={value}` equals the {config_class.__name__} "
+                "default; use another value so that the test shows the "
+                f"converter reads `{field}`."
+            )
+    if problems:
+        return problems
+
+    reference = config_class(**config)
+    for field in CONFIG_FIELDS:
+        value = getattr(reference, field, None)
+        if field in config or value == getattr(defaults, field, None):
+            continue
+        problem = isinstance(value, int) and out_of_bounds(field, value)
+        if problem:
+            problems.append(
+                f"{problem} {config_class.__name__} derives it from the "
+                "fields that the test sets."
+            )
+    heads = getattr(reference, "num_attention_heads", None)
+    if not isinstance(heads, int):
+        return problems
+    # With one key/value head, or one per query head, grouping them wrongly
+    # changes nothing.
+    kv_heads = getattr(reference, "num_key_value_heads", None)
+    if isinstance(kv_heads, int) and not 1 < kv_heads < heads:
+        problems.append(
+            f"`num_key_value_heads` is {kv_heads}; set it to more than 1 and "
+            f"less than `num_attention_heads` ({heads}), so that the test "
+            "runs grouped-query attention."
+        )
+    # A converter that computes the head size from the width would pass too.
+    width = getattr(reference, "hidden_size", 0)
+    if "head_dim" in config and config["head_dim"] == width // heads:
+        problems.append(
+            f"`head_dim={config['head_dim']}` equals `hidden_size // "
+            "num_attention_heads`; use another value so that the test shows "
+            "the converter reads `head_dim`."
+        )
+    return problems
 
 
 def check_known_failures(known_failures):
@@ -308,6 +474,12 @@ def build_reference(reference_class, config, directory):
     reference_config = model_class.config_class(**config)
     torch.manual_seed(SEED)
     model = model_class(reference_config).eval()
+    num_parameters = sum(p.numel() for p in model.parameters())
+    if num_parameters > MAX_REFERENCE_PARAMETERS:
+        raise ValueError(
+            f"The reference model has {num_parameters:,} parameters, more "
+            f"than {MAX_REFERENCE_PARAMETERS:,}. Use a smaller config."
+        )
     with hidden_progress_bars():
         model.save_pretrained(directory)
         with tempfile.TemporaryDirectory() as scratch:

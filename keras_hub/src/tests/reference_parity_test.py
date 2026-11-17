@@ -260,6 +260,195 @@ class ReferenceParityTest(TestCase):
             check({"hidden": ("ok", 0.0), "logits": ("nonfinite_keras", None)}),
         )
 
+    def test_check_config_accepts(self):
+        pytest.importorskip("transformers")
+        check = reference_parity.check_config
+        self.assertEqual(check("GPT2LMHeadModel", GPT2_CONFIG), [])
+        # Equal to the default, but exempt: convert_bert supports only 2.
+        config = {"vocab_size": 211, "type_vocab_size": 2, "pad_token_id": 0}
+        self.assertEqual(check("BertModel", config), [])
+
+    def test_check_config_rejects_unclassified_fields(self):
+        pytest.importorskip("transformers")
+        for field, value in (
+            ("hidden_act", "gelu"),
+            ("attention_dropout", 0.1),
+            ("attention_bias", True),
+            ("rope_theta", 100.0),
+            ("not_a_field", 1),
+        ):
+            self.assertEqual(
+                reference_parity.check_config(
+                    "LlamaForCausalLM", {field: value}
+                ),
+                [
+                    f"`{field}` is not a field a parity test may set; ask a "
+                    f"maintainer to classify `{field}`."
+                ],
+            )
+
+    def test_check_config_rejects_bad_values(self):
+        pytest.importorskip("transformers")
+        for field, value, message in (
+            ("vocab_size", 16, "`vocab_size=16` is out of bounds"),
+            ("vocab_size", 1000, "`vocab_size=1000` is out of bounds"),
+            ("n_embd", 128, "`n_embd=128` is out of bounds"),
+            ("n_layer", 1, "`n_layer=1` is out of bounds"),
+            ("n_layer", 7, "`n_layer=7` is out of bounds"),
+            ("n_head", 1, "`n_head=1` is out of bounds"),
+            ("n_positions", 16, "`n_positions=16` is out of bounds"),
+            ("n_positions", 256, "`n_positions=256` is out of bounds"),
+            ("bos_token_id", 5, "`bos_token_id=5` is out of bounds"),
+            # A window as long as the inputs would leave it untested.
+            ("sliding_window", 4096, "`sliding_window=4096` is out of bounds"),
+            ("sliding_window", 17, "`sliding_window=17` is out of bounds"),
+            ("n_layer", 3.0, "`n_layer` must be an integer"),
+            ("n_layer", True, "`n_layer` must be an integer"),
+        ):
+            config = dict(GPT2_CONFIG, **{field: value})
+            problems = reference_parity.check_config("GPT2LMHeadModel", config)
+            self.assertLen(problems, 1)
+            self.assertIn(message, problems[0])
+
+    def test_check_config_rejects_head_dim(self):
+        pytest.importorskip("transformers")
+        config = {
+            "hidden_size": 72,
+            "num_attention_heads": 6,
+            "num_key_value_heads": 2,
+            "head_dim": 10,
+        }
+        check = reference_parity.check_config
+        self.assertEqual(check("LlamaForCausalLM", config), [])
+        # A converter that computes the head size would pass with 12.
+        self.assertEqual(
+            check("LlamaForCausalLM", dict(config, head_dim=12)),
+            [
+                "`head_dim=12` equals `hidden_size // num_attention_heads`; "
+                "use another value so that the test shows the converter "
+                "reads `head_dim`."
+            ],
+        )
+        self.assertEqual(
+            check("LlamaForCausalLM", dict(config, head_dim=1)),
+            ["`head_dim=1` is out of bounds: a size field must be at least 4."],
+        )
+
+    def test_check_config_rejects_derived_values(self):
+        pytest.importorskip("transformers")
+        check = reference_parity.check_config
+        config = {"hidden_size": 72, "num_attention_heads": 6}
+        kv_heads = (
+            "`num_key_value_heads` is {}; set it to more than 1 and less than "
+            "`num_attention_heads` (6), so that the test runs grouped-query "
+            "attention."
+        )
+        # LlamaConfig sets `num_key_value_heads` to `num_attention_heads`
+        # when it is not given.
+        self.assertEqual(
+            check("LlamaForCausalLM", config), [kv_heads.format(6)]
+        )
+        self.assertEqual(
+            check("LlamaForCausalLM", dict(config, num_key_value_heads=6)),
+            [kv_heads.format(6)],
+        )
+        self.assertEqual(
+            check("LlamaForCausalLM", dict(config, num_key_value_heads=2)), []
+        )
+        # One key/value head is below the bound of a heads field.
+        self.assertEqual(
+            check("LlamaForCausalLM", dict(config, num_key_value_heads=1)),
+            [
+                "`num_key_value_heads=1` is out of bounds: a heads field must "
+                "be at least 2."
+            ],
+        )
+        # A value that the config class derives must be within bounds too:
+        # the head size here, and below the window of ModernBERT, whose
+        # `local_attention` is twice `sliding_window`.
+        self.assertEqual(
+            check(
+                "LlamaForCausalLM",
+                {
+                    "hidden_size": 16,
+                    "num_attention_heads": 8,
+                    "num_key_value_heads": 2,
+                },
+            ),
+            [
+                "`head_dim=2` is out of bounds: a size field must be at least "
+                "4. LlamaConfig derives it from the fields that the test sets."
+            ],
+        )
+        self.assertEqual(
+            check("ModernBertModel", {"sliding_window": 12}),
+            [
+                "`local_attention=24` is out of bounds: a window field must "
+                "be 2 to 16. ModernBertConfig derives it from the fields that "
+                "the test sets."
+            ],
+        )
+
+    def test_check_config_rejects_default_shape(self):
+        pytest.importorskip("transformers")
+        problems = reference_parity.check_config(
+            "LlamaForCausalLM", {"intermediate_size": 11008}
+        )
+        self.assertEqual(
+            problems,
+            [
+                "`intermediate_size=11008` equals the LlamaConfig default; use "
+                "another value so that the test shows the converter reads "
+                "`intermediate_size`."
+            ],
+        )
+        self.assertEqual(
+            reference_parity.check_config("NotAModel", {}),
+            ["`NotAModel` is not a transformers class."],
+        )
+
+    def test_check_config_rejects_default_structure(self):
+        pytest.importorskip("transformers")
+        check = reference_parity.check_config
+        # A converter that ignores the top-k of Mixtral would pass with the
+        # default of 2, as the Keras backbone defaults to 2 too.
+        self.assertEqual(
+            check("MixtralForCausalLM", {"num_experts_per_tok": 2}),
+            [
+                "`num_experts_per_tok=2` equals the MixtralConfig default; "
+                "use another value so that the test shows the converter "
+                "reads `num_experts_per_tok`."
+            ],
+        )
+        # A field in DEFAULT_FIELDS may keep its default.
+        config = {
+            "hidden_size": 72,
+            "num_attention_heads": 6,
+            "num_key_value_heads": 2,
+            "decoder_sparse_step": 1,
+        }
+        self.assertEqual(check("Qwen2MoeForCausalLM", config), [])
+
+    def test_reference_parameter_cap(self):
+        pytest.importorskip("torch")
+        pytest.importorskip("transformers")
+        config = {
+            "vocab_size": 512,
+            "hidden_size": 96,
+            "intermediate_size": 5000,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+        }
+        self.assertEqual(
+            reference_parity.check_config("LlamaForCausalLM", config), []
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "more than 5,000,000"):
+                reference_parity.build_reference(
+                    "LlamaForCausalLM", config, directory
+                )
+
     def test_check_known_failures(self):
         check = reference_parity.check_known_failures
         known = {"revealing": (MISTRAL_FLOAT16, 3e-4)}
@@ -398,11 +587,11 @@ class ReferenceParityTest(TestCase):
     def test_bad_arguments_fail_before_running(self):
         pytest.importorskip("transformers")
         with mock.patch.object(reference_parity, "run_checks") as run_checks:
-            with self.assertRaisesRegex(AssertionError, "needs a tuple"):
+            with self.assertRaisesRegex(AssertionError, "layer_norm_epsilon"):
                 self.run_reference_parity_test(
                     model_type="gpt2",
                     reference_class="GPT2LMHeadModel",
-                    config=GPT2_CONFIG,
+                    config=dict(GPT2_CONFIG, layer_norm_epsilon=1e-6),
                     backbone_cls=GPT2Backbone,
                     known_failures={"revealing": ""},
                 )

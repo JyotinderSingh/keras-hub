@@ -1394,7 +1394,9 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
             model_type: string. The `model_type` keras-hub dispatches on.
             reference_class: string. The transformers class to save, e.g.
                 `"GPT2LMHeadModel"`.
-            config: dict. Small values for fields of the reference config.
+            config: dict. Small values for the shape, token id and
+                structural fields of the reference config. Other fields are
+                rejected; see `reference_parity.CONFIG_FIELDS`.
             backbone_cls: The keras-hub backbone class the load must return.
             task_cls: Optional keras-hub task class to load through, whose
                 logits are then compared too.
@@ -1419,7 +1421,8 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
             f"({reference_class} against "
             f"{(task_cls or backbone_cls).__name__}):"
         )
-        problems = reference_parity.check_known_failures(known_failures)
+        problems = reference_parity.check_config(reference_class, config)
+        problems += reference_parity.check_known_failures(known_failures)
         if problems:
             self.fail("\n".join([header] + problems))
 
