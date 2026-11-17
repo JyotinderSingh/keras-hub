@@ -1368,6 +1368,7 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
         config,
         backbone_cls,
         task_cls=None,
+        known_failures=None,
     ):
         """Check a transformers converter against the transformers model.
 
@@ -1384,6 +1385,10 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
           the transformers output, at every valid position.
 
         A negative control checks the test itself.
+        Only the parity check can be a known failure. If
+        every failure is a known failure within its `max_error`, the test
+        shows as XFAIL; a known failure that no longer happens, or that
+        measures above its `max_error` or far below it, fails the test.
 
         Args:
             model_type: string. The `model_type` keras-hub dispatches on.
@@ -1393,6 +1398,12 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
             backbone_cls: The keras-hub backbone class the load must return.
             task_cls: Optional keras-hub task class to load through, whose
                 logits are then compared too.
+            known_failures: Optional dict from `"revealing"` to a tuple
+                `(reason, max_error)`: what is wrong today (and the issue, once
+                filed), and the largest error the check may reach, about
+                twice what it measures. The check then cannot see a smaller
+                defect, so test a code path that fails in a test method of
+                its own.
         """
         import pytest
 
@@ -1402,11 +1413,15 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
             pytest.importorskip(module)
         from keras_hub.src.tests import reference_parity
 
+        known_failures = known_failures or {}
         header = (
             f"Reference parity of model_type `{model_type}` "
             f"({reference_class} against "
             f"{(task_cls or backbone_cls).__name__}):"
         )
+        problems = reference_parity.check_known_failures(known_failures)
+        if problems:
+            self.fail("\n".join([header] + problems))
 
         with tempfile.TemporaryDirectory() as directory:
             problems, comparisons, notes = reference_parity.run_checks(
@@ -1417,13 +1432,25 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
                 task_cls,
                 directory,
             )
-        failures = reference_parity.judge_checks(comparisons)
+        failures, expected = reference_parity.apply_known_failures(
+            comparisons, known_failures
+        )
         measured = []
         if notes:
             measured = ["Measured:"] + [f"  {note}" for note in notes]
         if problems or failures:
             lines = [header] + problems + failures
+            if expected:
+                lines += ["Known failures that still fail:"] + expected
             self.fail("\n".join(lines + measured))
+        if expected:
+            message = "\n".join(
+                [f"{header} known failures:"] + expected + measured
+            )
+            pytest.xfail(message)
+            # Reached under `pytest --runxfail`, which shows known failures
+            # as failures.
+            self.fail(message)
 
     def get_test_data_dir(self):
         return str(pathlib.Path(__file__).parent / "test_data")

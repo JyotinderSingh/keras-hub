@@ -92,7 +92,9 @@ filterwarnings = [
     "ignore::FutureWarning",
     "ignore::UserWarning",
 ]
-addopts = "-vv"
+# `-rfEx` is pytest's default `-rfE` plus `x`: the short test summary also
+# lists expected failures, with their reasons.
+addopts = "-vv -rfEx"
 
 # Do not run tests in the `build` folders
 norecursedirs = ["build"]

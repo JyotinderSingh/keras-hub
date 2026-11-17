@@ -22,6 +22,11 @@ GPT2_CONFIG = {
     "bos_token_id": 1,
     "eos_token_id": 1,
 }
+# The reasons of known failures in these tests.
+MISTRAL_FLOAT16 = (
+    "convert_mistral rounds every weight to float16, so a float32 "
+    "checkpoint does not load exactly."
+)
 
 
 class ReferenceParityTest(TestCase):
@@ -255,26 +260,84 @@ class ReferenceParityTest(TestCase):
             check({"hidden": ("ok", 0.0), "logits": ("nonfinite_keras", None)}),
         )
 
-    def test_judge_checks(self):
-        def judge(**errors):
+    def test_check_known_failures(self):
+        check = reference_parity.check_known_failures
+        known = {"revealing": (MISTRAL_FLOAT16, 3e-4)}
+        self.assertEqual(check(known), [])
+        problems = check(
+            {
+                "unread": ("Not read.", 1.0),
+                "revealing": MISTRAL_FLOAT16,
+            }
+        )
+        self.assertLen(problems, 2)
+        self.assertIn("`unread` is not a parity check", problems[0])
+        for problem in problems[1:]:
+            self.assertIn("needs a tuple `(reason, max_error)`", problem)
+        # The reason must not be empty.
+        self.assertLen(check({"revealing": (" ", 1e-2)}), 1)
+        # `max_error` must be above the threshold.
+        self.assertLen(check({"revealing": (MISTRAL_FLOAT16, 1e-4)}), 1)
+
+    def test_apply_known_failures(self):
+        def apply(known_failures, **errors):
             comparisons = {
                 check: {"hidden": ("ok", error)}
                 for check, error in errors.items()
             }
-            return reference_parity.judge_checks(comparisons)
+            return reference_parity.apply_known_failures(
+                comparisons, known_failures
+            )
 
-        # A failing check is a failure, with a hint.
-        failures = judge(revealing=2e-4)
+        known = {"revealing": (MISTRAL_FLOAT16, 3e-2)}
+        # A known failure within its max_error is expected.
+        self.assertEqual(
+            apply(known, revealing=1.3e-2),
+            (
+                [],
+                [
+                    f"revealing: {MISTRAL_FLOAT16}\n  measured: per-position "
+                    "error above 1e-04: hidden 1.30e-02 (max_error 0.03)"
+                ],
+            ),
+        )
+        # A failure that is not listed is a failure, with a hint.
+        failures, expected = apply({}, revealing=2e-4)
+        self.assertEqual(expected, [])
         self.assertLen(failures, 1)
         self.assertStartsWith(
             failures[0],
             "revealing: per-position error above 1e-04: hidden 2.00e-04\n  "
             "Weights drawn at full scale: look for a swapped, transposed",
         )
-        # A check that did not run, as after a failed load, is not judged.
-        self.assertEqual(judge(), [])
+        # A known failure that no longer happens is a failure.
+        self.assertEqual(
+            apply(known, revealing=1e-5),
+            (
+                [
+                    "known failure `revealing` no longer happens; remove it "
+                    f"from known_failures (reason was: {MISTRAL_FLOAT16})"
+                ],
+                [],
+            ),
+        )
+        # So is one above its max_error: a new defect, or the known one grew.
+        failures, _ = apply(known, revealing=0.5)
+        self.assertIn("This is above the max_error 0.03", failures[0])
+        self.assertIn("look for a swapped, transposed", failures[0])
+        failures, _ = reference_parity.apply_known_failures(
+            {"revealing": {"hidden": ("nonfinite_keras", None)}}, known
+        )
+        self.assertIn("NaN or inf in the Keras output", failures[0])
+        # And one far below it, whose max_error would hide a new defect.
+        failures, _ = apply(known, revealing=1e-3)
+        self.assertIn("less than 1/10 of its max_error 0.03", failures[0])
+        self.assertIn("the remaining error is another defect", failures[0])
+        # A known failure whose check did not run, as after a failed load,
+        # is not judged.
+        self.assertEqual(apply(known), ([], []))
 
-    def run_with_errors(self, errors, problems=()):
+    def run_with_errors(self, errors, problems=(), known_failures=None):
         pytest.importorskip("torch")
         pytest.importorskip("transformers")
         pytest.importorskip("safetensors")
@@ -294,19 +357,56 @@ class ReferenceParityTest(TestCase):
                 reference_class="GPT2LMHeadModel",
                 config=GPT2_CONFIG,
                 backbone_cls=GPT2Backbone,
+                known_failures=known_failures,
             )
 
-    def test_failures_fail_the_test(self):
+    def test_known_failures_are_strict(self):
         passing = {"revealing": 1e-5}
         failing = {"revealing": 1.3e-2}
+        known = {"revealing": (MISTRAL_FLOAT16, 3e-2)}
         self.run_with_errors(passing)
+        # The test shows as XFAIL, with the reasons. `pytest.xfail` is
+        # patched, so that this test passes under `pytest --runxfail` too.
+        xfailed = pytest.xfail.Exception
+        with mock.patch.object(pytest, "xfail", side_effect=xfailed) as xfail:
+            with self.assertRaises(xfailed):
+                self.run_with_errors(failing, known_failures=known)
+        self.assertIn(MISTRAL_FLOAT16, xfail.call_args.args[0])
+        # `pytest --runxfail` makes `pytest.xfail` return; the test fails.
+        with mock.patch.object(pytest, "xfail") as xfail:
+            with self.assertRaisesRegex(AssertionError, "convert_mistral"):
+                self.run_with_errors(failing, known_failures=known)
+        xfail.assert_called_once()
         with self.assertRaisesRegex(
             AssertionError, "revealing: per-position error above 1e-04"
         ):
             self.run_with_errors(failing)
-        # Problems fail the test, even when every parity check passes.
+        with self.assertRaisesRegex(
+            AssertionError,
+            "known failure `revealing` no longer happens; remove it",
+        ):
+            self.run_with_errors(passing, known_failures=known)
+        # A new defect cannot hide behind a known failure.
+        with self.assertRaisesRegex(AssertionError, "above the max_error"):
+            self.run_with_errors({"revealing": 0.5}, known_failures=known)
+        # Problems are never known failures.
         with self.assertRaisesRegex(AssertionError, "negative control"):
-            self.run_with_errors(passing, ["negative control: blind"])
+            self.run_with_errors(
+                failing, ["negative control: blind"], known_failures=known
+            )
+
+    def test_bad_arguments_fail_before_running(self):
+        pytest.importorskip("transformers")
+        with mock.patch.object(reference_parity, "run_checks") as run_checks:
+            with self.assertRaisesRegex(AssertionError, "needs a tuple"):
+                self.run_reference_parity_test(
+                    model_type="gpt2",
+                    reference_class="GPT2LMHeadModel",
+                    config=GPT2_CONFIG,
+                    backbone_cls=GPT2Backbone,
+                    known_failures={"revealing": ""},
+                )
+        run_checks.assert_not_called()
 
     def test_describe_load_failure(self):
         pytest.importorskip("transformers")

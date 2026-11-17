@@ -53,6 +53,11 @@ SEQUENCE_LENGTH = 17
 MIN_TOKEN_ID = 5
 # Seeds the weight draws, the inputs and the Keras initializers.
 SEED = 0
+# The `max_error` of a known failure may be at most this many times what it
+# measures, so that it stays close to the known error. A known failure still
+# hides every defect smaller than itself: give a code path that fails its own
+# test method, and keep it out of the main test.
+MAX_ERROR_SLACK = 10
 
 STATUS_TEXT = {
     "shape": "shapes differ",
@@ -61,24 +66,83 @@ STATUS_TEXT = {
 }
 
 
-def judge_checks(comparisons):
-    """Judges the parity checks.
+def check_known_failures(known_failures):
+    """Returns a list of problems with the `known_failures` of a test."""
+    problems = []
+    for check, value in known_failures.items():
+        if check not in CHECKS:
+            problems.append(
+                f"`known_failures`: `{check}` is not a parity check "
+                f"({', '.join(CHECKS)})."
+            )
+        elif not (
+            isinstance(value, tuple)
+            and len(value) == 2
+            and isinstance(value[0], str)
+            and value[0].strip()
+            and isinstance(value[1], (int, float))
+            and value[1] > PARITY_THRESHOLD
+        ):
+            problems.append(
+                f"`known_failures`: `{check}` needs a tuple `(reason, "
+                "max_error)`: what is wrong today, and the largest "
+                "per-position error it may reach, above "
+                f"{PARITY_THRESHOLD:.0e}."
+            )
+    return problems
+
+
+def apply_known_failures(comparisons, known_failures):
+    """Judges the parity checks against the known failures of a test.
 
     `comparisons` maps each check that ran to the comparison of its
-    outputs.
+    outputs, and `known_failures` maps one to `(reason, max_error)`. A
+    known failure is excused only while its largest error stays between
+    `max_error / MAX_ERROR_SLACK` and `max_error`. This catches a new defect
+    larger than the known one, but not a smaller one.
 
     Returns:
-        A list of strings: the failures, each with the hint of its check.
+        A tuple `(failures, expected)` of lists of strings: the failures
+        that are not excused, including known failures that are gone, and
+        the excused known failures.
     """
-    failures = []
+    failures, expected = [], []
     for check in CHECKS:
         if check not in comparisons:
             continue
         failure = check_parity(comparisons[check])
         hint = FAILURE_HINTS[check]
-        if failure is not None:
-            failures.append(f"{check}: {failure}\n  {hint}")
-    return failures
+        if check not in known_failures:
+            if failure is not None:
+                failures.append(f"{check}: {failure}\n  {hint}")
+            continue
+        reason, max_error = known_failures[check]
+        error = largest_error(comparisons[check])
+        if failure is None:
+            failures.append(
+                f"known failure `{check}` no longer happens; remove it from "
+                f"known_failures (reason was: {reason})"
+            )
+        elif error > max_error:
+            failures.append(
+                f"{check}: {failure}\n  This is above the max_error "
+                f"{max_error:g} of its known failure: a new defect, or the "
+                f"known one grew (reason was: {reason})\n  {hint}"
+            )
+        elif error * MAX_ERROR_SLACK < max_error:
+            failures.append(
+                f"known failure `{check}` shrank to {error:.2e}, less than "
+                f"1/{MAX_ERROR_SLACK} of its max_error {max_error:g}: if a "
+                "fix landed, the remaining error is another defect; update "
+                "the reason and max_error to it, or remove the entry (reason "
+                f"was: {reason})"
+            )
+        else:
+            expected.append(
+                f"{check}: {reason}\n  measured: {failure} (max_error "
+                f"{max_error:g})"
+            )
+    return failures, expected
 
 
 def unit_draw(seed, key, shape):
@@ -510,8 +574,8 @@ def run_checks(
 
     The arguments are those of `TestCase.run_reference_parity_test`, and
     `directory` is an empty directory for the checkpoints. Returns a tuple
-    `(problems, comparisons, notes)`: the failures other than a parity
-    failure (a failed load,
+    `(problems, comparisons, notes)`: the failures that no known
+    failure can excuse (a failed load,
     a wrong test argument, test machinery that does not work), the
     comparison of the outputs under each check that ran, and what was
     measured.
