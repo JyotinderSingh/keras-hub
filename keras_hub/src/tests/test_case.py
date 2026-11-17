@@ -1375,22 +1375,26 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
         """Check a transformers converter against the transformers model.
 
         A tiny `reference_class` model is built from `config`, its weights
-        are redrawn ("revealing"), and the checkpoint written by
-        `save_pretrained` is loaded with `from_preset` on the CPU. The test
-        checks that:
+        are redrawn twice ("revealing" and "low_variance"), and each
+        checkpoint written by `save_pretrained` is loaded with `from_preset`
+        on the CPU. If the config has normalization epsilon fields, the
+        "epsilon" check loads the low_variance weights again, once for each
+        value of `reference_parity.EPSILONS`, to which the helper sets every
+        such field. The test checks that:
 
         - `from_preset` succeeds and returns `backbone_cls` (and `task_cls`,
           if given);
         - the converter reads every stored tensor and assigns every Keras
           weight, except those named in `ignored_reference_tensors` and
           `derived_weights`;
-        - every output (hidden states, pooled output, and the
+        - for each of `revealing`, `low_variance` and `epsilon` (at each of
+          its values), every output (hidden states, pooled output, and the
           logits of `task_cls`) differs from transformers by at most
           `reference_parity.PARITY_THRESHOLD` times the root mean square of
           the transformers output, at every valid position.
 
         A negative control and a second load without the audit check the
-        test itself. Only the parity check can be a known failure. If
+        test itself. Only the three parity checks can be known failures. If
         every failure is a known failure within its `max_error`, the test
         shows as XFAIL; a known failure that no longer happens, or that
         measures above its `max_error` or far below it, fails the test.
@@ -1400,8 +1404,9 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
             reference_class: string. The transformers class to save, e.g.
                 `"GPT2LMHeadModel"`.
             config: dict. Small values for the shape, token id and
-                structural fields of the reference config. Other fields are
-                rejected; see `reference_parity.CONFIG_FIELDS`.
+                structural fields of the reference config. Other fields,
+                epsilons included, are rejected; see
+                `reference_parity.CONFIG_FIELDS`.
             backbone_cls: The keras-hub backbone class the load must return.
             task_cls: Optional keras-hub task class to load through, whose
                 logits are then compared too.
@@ -1412,8 +1417,9 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
                 weight paths to the reason they are not assigned: weights
                 that the model computes from its config instead of loading.
                 Each pattern must match only weights that are not assigned.
-            known_failures: Optional dict from `"revealing"` to a tuple
-                `(reason, max_error)`: what is wrong today (and the issue, once
+            known_failures: Optional dict from `"revealing"`,
+                `"low_variance"` or `"epsilon"` to a tuple `(reason,
+                max_error)`: what is wrong today (and the issue, once
                 filed), and the largest error the check may reach, about
                 twice what it measures. The check then cannot see a smaller
                 defect, so test a code path that fails in a test method of
@@ -1447,7 +1453,7 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
             self.fail("\n".join([header] + problems))
 
         with tempfile.TemporaryDirectory() as directory:
-            problems, comparisons, notes = reference_parity.run_checks(
+            problems, comparisons, notes, fields = reference_parity.run_checks(
                 model_type,
                 reference_class,
                 config,
@@ -1458,7 +1464,7 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
                 directory,
             )
         failures, expected = reference_parity.apply_known_failures(
-            comparisons, known_failures
+            comparisons, known_failures, fields
         )
         measured = []
         if notes:

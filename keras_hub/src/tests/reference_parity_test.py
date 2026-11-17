@@ -10,9 +10,22 @@ from keras.src.backend.common.variables import Variable
 
 from keras_hub.src.models.gpt2.gpt2_backbone import GPT2Backbone
 from keras_hub.src.models.gpt2.gpt2_causal_lm import GPT2CausalLM
+from keras_hub.src.models.mixtral.mixtral_backbone import MixtralBackbone
+from keras_hub.src.models.mixtral.mixtral_causal_lm import MixtralCausalLM
+from keras_hub.src.models.mixtral.mixtral_decoder import (
+    MixtralTransformerDecoder,
+)
+from keras_hub.src.models.modern_bert.modern_bert_backbone import (
+    ModernBertBackbone,
+)
+from keras_hub.src.models.modern_bert.modern_bert_layers import (
+    ModernBertEncoderLayer,
+)
+from keras_hub.src.models.qwen.qwen_backbone import QwenBackbone
 from keras_hub.src.tests import reference_parity
 from keras_hub.src.tests.test_case import TestCase
 from keras_hub.src.utils.transformers import convert_gpt2
+from keras_hub.src.utils.transformers import convert_qwen
 from keras_hub.src.utils.transformers import preset_loader
 from keras_hub.src.utils.transformers import safetensor_utils
 
@@ -26,7 +39,26 @@ GPT2_CONFIG = {
     "bos_token_id": 1,
     "eos_token_id": 1,
 }
+MODERN_BERT_CONFIG = {
+    "vocab_size": 211,
+    "hidden_size": 48,
+    "intermediate_size": 80,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 4,
+    "max_position_embeddings": 64,
+    "local_attention": 8,
+    "global_attn_every_n_layers": 2,
+    "pad_token_id": 0,
+    "cls_token_id": 1,
+    "sep_token_id": 2,
+    "bos_token_id": 1,
+    "eos_token_id": 2,
+}
 # The reasons of known failures in these tests.
+QWEN3_EPSILON = (
+    "qwen3_decoder.py does not pass `layer_norm_epsilon` to Qwen3Attention, "
+    "so the query and key norms keep its 1e-5 default."
+)
 MISTRAL_FLOAT16 = (
     "convert_mistral rounds every weight to float16, so a float32 "
     "checkpoint does not load exactly."
@@ -68,34 +100,93 @@ class ReferenceParityTest(TestCase):
             "position_ids": np.arange(4, dtype="int64"),
         }
         roles = {
-            "dense.weight": ("parameter", "weight"),
-            "dense.bias": ("parameter", "bias"),
-            "norm.weight": ("parameter", "weight"),
-            "norm.bias": ("parameter", "bias"),
+            "dense.weight": ("parameter", "Linear", "weight"),
+            "dense.bias": ("parameter", "Linear", "bias"),
+            "norm.weight": ("parameter", "LayerNorm", "weight"),
+            "norm.bias": ("parameter", "LayerNorm", "bias"),
             "position_ids": None,
         }
 
-        def draw(key):
+        def draw(key, scale=1.0):
             shape = tensors[key].shape
-            return reference_parity.unit_draw(0, key, shape)
+            return scale * reference_parity.unit_draw(0, key, shape)
 
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "model.safetensors")
-            save_file(tensors, path, metadata={"format": "pt"})
-            reference_parity.redraw(path, roles)
-            redrawn, metadata = reference_parity.read_safetensors(path)
-            self.assertEqual(metadata, {"format": "pt"})
-            self.assertAllClose(
-                redrawn["dense.weight"], 0.6 * draw("dense.weight")
+            for init, scale in (("revealing", 1.0), ("low_variance", 0.01)):
+                save_file(tensors, path, metadata={"format": "pt"})
+                reference_parity.redraw(path, roles, init)
+                redrawn, metadata = reference_parity.read_safetensors(path)
+                self.assertEqual(metadata, {"format": "pt"})
+                self.assertAllClose(
+                    redrawn["dense.weight"], 0.6 * draw("dense.weight", scale)
+                )
+                self.assertAllClose(
+                    redrawn["dense.bias"], 0.25 * draw("dense.bias", scale)
+                )
+                # Normalization layers keep full-size noise.
+                self.assertAllClose(
+                    redrawn["norm.weight"], 1.0 + 0.25 * draw("norm.weight")
+                )
+                self.assertAllClose(
+                    redrawn["norm.bias"], 0.25 * draw("norm.bias")
+                )
+                self.assertAllEqual(redrawn["position_ids"], np.arange(4))
+
+    def test_epsilon_fields(self):
+        transformers = pytest.importorskip("transformers")
+
+        def fields(config):
+            found = reference_parity.epsilon_fields(config)
+            return {path: getattr(*field) for path, field in found.items()}
+
+        self.assertEqual(
+            fields(transformers.GPT2Config()), {"layer_norm_epsilon": 1e-5}
+        )
+        # Sub-configs are searched too.
+        self.assertEqual(
+            fields(transformers.Gemma3Config()),
+            {
+                "text_config.rms_norm_eps": 1e-6,
+                "vision_config.layer_norm_eps": 1e-6,
+            },
+        )
+        # DistilBERT hard-codes its epsilon.
+        self.assertEqual(fields(transformers.DistilBertConfig()), {})
+
+    def test_build_reference_sets_epsilons(self):
+        for module in ("torch", "transformers", "safetensors"):
+            pytest.importorskip(module)
+        with tempfile.TemporaryDirectory() as directory:
+            plain = reference_parity.build_reference(
+                "GPT2LMHeadModel",
+                GPT2_CONFIG,
+                os.path.join(directory, "plain"),
+                "low_variance",
             )
-            self.assertAllClose(
-                redrawn["dense.bias"], 0.25 * draw("dense.bias")
+            model = reference_parity.build_reference(
+                "GPT2LMHeadModel",
+                GPT2_CONFIG,
+                os.path.join(directory, "epsilon"),
+                "low_variance",
+                epsilon=3e-4,
             )
-            self.assertAllClose(
-                redrawn["norm.weight"], 1.0 + 0.25 * draw("norm.weight")
-            )
-            self.assertAllClose(redrawn["norm.bias"], 0.25 * draw("norm.bias"))
-            self.assertAllEqual(redrawn["position_ids"], np.arange(4))
+            tensors = [
+                reference_parity.read_safetensors(
+                    os.path.join(directory, name, "model.safetensors")
+                )[0]
+                for name in ("plain", "epsilon")
+            ]
+        self.assertEqual(plain.config.layer_norm_epsilon, 1e-5)
+        # The saved config and every layer norm of the model have it.
+        self.assertEqual(model.config.layer_norm_epsilon, 3e-4)
+        norms = [m for m in model.modules() if hasattr(m, "eps")]
+        self.assertLen(norms, 2 * GPT2_CONFIG["n_layer"] + 1)
+        self.assertTrue(all(norm.eps == 3e-4 for norm in norms))
+        # The weights are the same draws.
+        self.assertEqual(sorted(tensors[0]), sorted(tensors[1]))
+        for key, value in tensors[0].items():
+            self.assertAllEqual(value, tensors[1][key])
 
     def test_hidden_progress_bars(self):
         pytest.importorskip("transformers")
@@ -290,6 +381,28 @@ class ReferenceParityTest(TestCase):
                     f"maintainer to classify `{field}`."
                 ],
             )
+        # The helper owns the epsilons.
+        self.assertEqual(
+            reference_parity.check_config(
+                "LlamaForCausalLM", {"rms_norm_eps": 1e-5}
+            ),
+            [
+                "`rms_norm_eps` is set by the helper: the epsilon check sets "
+                "every normalization epsilon field to 3e-04, then to 3e-03. "
+                "Remove it from `config`."
+            ],
+        )
+        # Each of its values must be far from the default of every epsilon
+        # field.
+        with mock.patch.object(reference_parity, "EPSILONS", (3e-4, 3e-5)):
+            self.assertEqual(
+                reference_parity.check_config("GPT2LMHeadModel", GPT2_CONFIG),
+                [
+                    "`layer_norm_epsilon` defaults to 1e-05, within a factor "
+                    "of 10 of 3e-05, a value of the epsilon check; ask a "
+                    "maintainer to choose other EPSILONS."
+                ],
+            )
 
     def test_check_config_rejects_bad_values(self):
         pytest.importorskip("transformers")
@@ -450,7 +563,7 @@ class ReferenceParityTest(TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, "more than 5,000,000"):
                 reference_parity.build_reference(
-                    "LlamaForCausalLM", config, directory
+                    "LlamaForCausalLM", config, directory, "revealing"
                 )
 
     def test_check_reasons(self):
@@ -466,20 +579,22 @@ class ReferenceParityTest(TestCase):
 
     def test_check_known_failures(self):
         check = reference_parity.check_known_failures
-        known = {"revealing": (MISTRAL_FLOAT16, 3e-4)}
+        known = {
+            "low_variance": (QWEN3_EPSILON, 3e-2),
+            "epsilon": (QWEN3_EPSILON, 2e-3),
+        }
         self.assertEqual(check(known), [])
         problems = check(
             {
                 "unread": ("Not read.", 1.0),
                 "revealing": MISTRAL_FLOAT16,
+                "low_variance": (" ", 1e-2),
             }
         )
-        self.assertLen(problems, 2)
+        self.assertLen(problems, 3)
         self.assertIn("`unread` is not a parity check", problems[0])
         for problem in problems[1:]:
             self.assertIn("needs a tuple `(reason, max_error)`", problem)
-        # The reason must not be empty.
-        self.assertLen(check({"revealing": (" ", 1e-2)}), 1)
         # `max_error` must be above the threshold.
         self.assertLen(check({"revealing": (MISTRAL_FLOAT16, 1e-4)}), 1)
 
@@ -510,23 +625,23 @@ class ReferenceParityTest(TestCase):
                 for check, error in errors.items()
             }
             return reference_parity.apply_known_failures(
-                comparisons, known_failures
+                comparisons, known_failures, ["rms_norm_eps"]
             )
 
-        known = {"revealing": (MISTRAL_FLOAT16, 3e-2)}
+        known = {"low_variance": (QWEN3_EPSILON, 3e-2)}
         # A known failure within its max_error is expected.
         self.assertEqual(
-            apply(known, revealing=1.3e-2),
+            apply(known, revealing=1e-5, low_variance=1.3e-2),
             (
                 [],
                 [
-                    f"revealing: {MISTRAL_FLOAT16}\n  measured: per-position "
+                    f"low_variance: {QWEN3_EPSILON}\n  measured: per-position "
                     "error above 1e-04: hidden 1.30e-02 (max_error 0.03)"
                 ],
             ),
         )
         # A failure that is not listed is a failure, with a hint.
-        failures, expected = apply({}, revealing=2e-4)
+        failures, expected = apply(known, revealing=2e-4)
         self.assertEqual(expected, [])
         self.assertLen(failures, 1)
         self.assertStartsWith(
@@ -536,30 +651,111 @@ class ReferenceParityTest(TestCase):
         )
         # A known failure that no longer happens is a failure.
         self.assertEqual(
-            apply(known, revealing=1e-5),
+            apply(known, low_variance=1e-5),
             (
                 [
-                    "known failure `revealing` no longer happens; remove it "
-                    f"from known_failures (reason was: {MISTRAL_FLOAT16})"
+                    "known failure `low_variance` no longer happens; remove it "
+                    f"from known_failures (reason was: {QWEN3_EPSILON})"
                 ],
                 [],
             ),
         )
         # So is one above its max_error: a new defect, or the known one grew.
-        failures, _ = apply(known, revealing=0.5)
+        failures, _ = apply(known, low_variance=0.5)
         self.assertIn("This is above the max_error 0.03", failures[0])
+        self.assertIn("look for a normalization epsilon", failures[0])
+        # The epsilon hint shows only when revealing passes or stays within
+        # its known failure; when both fail, a wiring bug is more likely.
+        revealing_known = {"revealing": (MISTRAL_FLOAT16, 3e-4)}
+        failures, _ = apply(revealing_known, revealing=2e-4, low_variance=1)
+        self.assertIn("look for a normalization epsilon", failures[0])
+        failures, _ = apply({}, revealing=2e-4, low_variance=1)
         self.assertIn("look for a swapped, transposed", failures[0])
+        self.assertEqual(
+            failures[1],
+            "low_variance: per-position error above 1e-04: hidden 1.00e+00\n"
+            "  Revealing fails too: one bug usually fails both, so start "
+            "there. If the low_variance error is far larger, suspect a "
+            "normalization epsilon. Epsilon fields of the reference config: "
+            "`rms_norm_eps`.",
+        )
         failures, _ = reference_parity.apply_known_failures(
-            {"revealing": {"hidden": ("nonfinite_keras", None)}}, known
+            {"low_variance": {"hidden": ("nonfinite_keras", None)}}, known
         )
         self.assertIn("NaN or inf in the Keras output", failures[0])
         # And one far below it, whose max_error would hide a new defect.
-        failures, _ = apply(known, revealing=1e-3)
+        failures, _ = apply(known, low_variance=1e-3)
         self.assertIn("less than 1/10 of its max_error 0.03", failures[0])
         self.assertIn("the remaining error is another defect", failures[0])
         # A known failure whose check did not run, as after a failed load,
         # is not judged.
         self.assertEqual(apply(known), ([], []))
+        # A known failure of the epsilon check fails the test when the
+        # reference config has no epsilon field, as that check never runs.
+        failures, _ = reference_parity.apply_known_failures(
+            {"revealing": {"hidden": ("ok", 1e-5)}},
+            {"epsilon": (QWEN3_EPSILON, 1.0)},
+        )
+        self.assertEqual(
+            failures,
+            [
+                "known failure `epsilon` is for a check that does not run, as "
+                "the reference config has no normalization epsilon field; "
+                "remove it"
+            ],
+        )
+
+    def test_apply_known_failures_epsilon(self):
+        def apply(known_failures, **errors):
+            comparisons = {
+                check: {"hidden": ("ok", error)}
+                for check, error in errors.items()
+            }
+            return reference_parity.apply_known_failures(
+                comparisons, known_failures, ["rms_norm_eps"]
+            )
+
+        passing = {"revealing": 1e-5, "low_variance": 1e-6}
+        # The hint names the epsilon field that the check set, and its
+        # values.
+        self.assertEqual(
+            apply({}, **passing, epsilon=3.19),
+            (
+                [
+                    "epsilon: per-position error above 1e-04: hidden "
+                    "3.19e+00\n  The low_variance weights, with `rms_norm_eps` "
+                    "of the reference config set to 3e-04, then to 3e-03: "
+                    "look at how the converter maps `rms_norm_eps` to the "
+                    "backbone, and for an epsilon hard-coded in the backbone "
+                    "or its layers."
+                ],
+                [],
+            ),
+        )
+        # When another check fails too, start there.
+        failures, _ = apply({}, **dict(passing, low_variance=1), epsilon=3.19)
+        self.assertStartsWith(
+            failures[1],
+            "epsilon: per-position error above 1e-04: hidden 3.19e+00\n  "
+            "Another check fails too: one bug usually fails all of them, so "
+            "start there. If the epsilon error is far larger, look at how "
+            "the converter maps `rms_norm_eps`",
+        )
+        # A known failure of the epsilon check follows the same rules. Its
+        # entry names the fields set and their value.
+        known = {"epsilon": (QWEN3_EPSILON, 1.5e-3)}
+        failures, expected = apply(known, **passing, epsilon=7.1e-4)
+        self.assertEqual(failures, [])
+        self.assertStartsWith(
+            expected[0],
+            "epsilon (rms_norm_eps set to 3e-04, then to 3e-03): "
+            f"{QWEN3_EPSILON}",
+        )
+        failures, _ = apply(known, **passing, epsilon=1e-5)
+        self.assertStartsWith(failures[0], "known failure `epsilon` no longer")
+        failures, _ = apply(known, **passing, epsilon=0.5)
+        self.assertIn("above the max_error 0.0015", failures[0])
+        self.assertIn("look at how the converter maps", failures[0])
 
     def run_with_errors(self, errors, problems=(), known_failures=None):
         pytest.importorskip("torch")
@@ -572,6 +768,7 @@ class ReferenceParityTest(TestCase):
             list(problems),
             comparisons,
             ["converter: convert_gpt2"],
+            ["layer_norm_epsilon"],
         )
         with mock.patch.object(
             reference_parity, "run_checks", return_value=outcome
@@ -585,9 +782,9 @@ class ReferenceParityTest(TestCase):
             )
 
     def test_known_failures_are_strict(self):
-        passing = {"revealing": 1e-5}
-        failing = {"revealing": 1.3e-2}
-        known = {"revealing": (MISTRAL_FLOAT16, 3e-2)}
+        passing = {"revealing": 1e-5, "low_variance": 1e-6, "epsilon": 1e-6}
+        failing = dict(passing, low_variance=1.3e-2)
+        known = {"low_variance": (QWEN3_EPSILON, 3e-2)}
         self.run_with_errors(passing)
         # The test shows as XFAIL, with the reasons. `pytest.xfail` is
         # patched, so that this test passes under `pytest --runxfail` too.
@@ -595,24 +792,33 @@ class ReferenceParityTest(TestCase):
         with mock.patch.object(pytest, "xfail", side_effect=xfailed) as xfail:
             with self.assertRaises(xfailed):
                 self.run_with_errors(failing, known_failures=known)
-        self.assertIn(MISTRAL_FLOAT16, xfail.call_args.args[0])
+        self.assertIn(QWEN3_EPSILON, xfail.call_args.args[0])
         # `pytest --runxfail` makes `pytest.xfail` return; the test fails.
         with mock.patch.object(pytest, "xfail") as xfail:
-            with self.assertRaisesRegex(AssertionError, "convert_mistral"):
+            with self.assertRaisesRegex(AssertionError, "Qwen3Attention"):
                 self.run_with_errors(failing, known_failures=known)
         xfail.assert_called_once()
+        # The epsilon check is judged like the others.
         with self.assertRaisesRegex(
-            AssertionError, "revealing: per-position error above 1e-04"
+            AssertionError,
+            "epsilon: per-position error above 1e-04: hidden 3.19e\\+00\n"
+            "  The low_variance weights, with `layer_norm_epsilon` of the",
+        ):
+            self.run_with_errors(dict(passing, epsilon=3.19))
+        with self.assertRaisesRegex(
+            AssertionError, "low_variance: per-position error above 1e-04"
         ):
             self.run_with_errors(failing)
         with self.assertRaisesRegex(
             AssertionError,
-            "known failure `revealing` no longer happens; remove it",
+            "known failure `low_variance` no longer happens; remove it",
         ):
             self.run_with_errors(passing, known_failures=known)
         # A new defect cannot hide behind a known failure.
         with self.assertRaisesRegex(AssertionError, "above the max_error"):
-            self.run_with_errors({"revealing": 0.5}, known_failures=known)
+            self.run_with_errors(
+                dict(passing, low_variance=0.5), known_failures=known
+            )
         # Problems are never known failures.
         with self.assertRaisesRegex(AssertionError, "negative control"):
             self.run_with_errors(
@@ -802,3 +1008,138 @@ class ReferenceParityTest(TestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, "bug in LoadAudit"):
                     self.run_reference_parity_test(**arguments)
+
+    def test_epsilon_check_sees_an_ignored_epsilon(self):
+        for module in ("torch", "transformers", "safetensors"):
+            pytest.importorskip(module)
+        convert_backbone_config = convert_qwen.convert_backbone_config
+
+        def ignore_epsilon(transformers_config):
+            config = convert_backbone_config(transformers_config)
+            config.pop("layer_norm_epsilon", None)
+            return config
+
+        # QwenBackbone and transformers both default to 1e-6, so only the
+        # epsilon check sees that the converter ignores `rms_norm_eps`.
+        with mock.patch.object(
+            convert_qwen, "convert_backbone_config", ignore_epsilon
+        ):
+            with self.assertRaises(AssertionError) as context:
+                self.run_reference_parity_test(
+                    model_type="qwen2",
+                    reference_class="Qwen2ForCausalLM",
+                    config={
+                        "vocab_size": 211,
+                        "hidden_size": 72,
+                        "intermediate_size": 100,
+                        "num_hidden_layers": 2,
+                        "num_attention_heads": 6,
+                        "num_key_value_heads": 2,
+                        "max_position_embeddings": 64,
+                    },
+                    backbone_cls=QwenBackbone,
+                )
+        message = str(context.exception)
+        self.assertIn("\nepsilon: per-position error above 1e-04", message)
+        self.assertIn(
+            "with `rms_norm_eps` of the reference config set to 3e-04, then "
+            "to 3e-03",
+            message,
+        )
+        # "Measured" lists every load, failed or not, with the epsilon set.
+        measured = message[message.index("\nMeasured:") :]
+        self.assertIn("\n  revealing: hidden ", measured)
+        self.assertIn("\n  low_variance: hidden ", measured)
+        self.assertIn("\n  epsilon (rms_norm_eps set to 3e-04): ", measured)
+        self.assertIn("\n  epsilon (rms_norm_eps set to 3e-03): ", measured)
+
+    def test_epsilon_check_sees_a_hard_coded_epsilon(self):
+        for module in ("torch", "transformers", "safetensors"):
+            pytest.importorskip(module)
+        build = MixtralTransformerDecoder.build
+
+        def hard_code_epsilon(decoder, decoder_sequence_shape):
+            build(decoder, decoder_sequence_shape)
+            decoder._feedforward_layernorm.epsilon = 1e-5
+
+        # Only the norm in front of the mixture of experts ignores the
+        # epsilon of the config, and keeps Mixtral's 1e-5 default. The small
+        # weights make the output of that block second order, so the epsilon
+        # check measures only about 7e-4. That is the defect, not noise: it
+        # measures 7.05e-4 on all three backends, about 600 times the 1.1e-6
+        # that the same config measures without the defect.
+        with mock.patch.object(
+            MixtralTransformerDecoder, "build", hard_code_epsilon
+        ):
+            with self.assertRaisesRegex(
+                AssertionError, "\nepsilon: per-position error above 1e-04"
+            ):
+                self.run_reference_parity_test(
+                    model_type="mixtral",
+                    reference_class="MixtralForCausalLM",
+                    config={
+                        "vocab_size": 211,
+                        "hidden_size": 72,
+                        "intermediate_size": 100,
+                        "num_hidden_layers": 3,
+                        "num_attention_heads": 6,
+                        "num_key_value_heads": 2,
+                        "max_position_embeddings": 64,
+                        "sliding_window": 8,
+                        "num_local_experts": 4,
+                        "num_experts_per_tok": 3,
+                    },
+                    backbone_cls=MixtralBackbone,
+                    task_cls=MixtralCausalLM,
+                )
+
+    def test_epsilon_check_sees_an_epsilon_hard_coded_in_the_layers(self):
+        for module in ("torch", "transformers", "safetensors"):
+            pytest.importorskip(module)
+        init = ModernBertEncoderLayer.__init__
+
+        def hard_code_epsilon(layer, *args, **kwargs):
+            init(layer, *args, **dict(kwargs, layer_norm_epsilon=1e-5))
+
+        # Every encoder layer keeps ModernBERT's 1e-5 default; the embedding
+        # and final norms get the epsilon of the config. With full-size
+        # weights in the embedding norm, the activations are large next to
+        # a small epsilon: at 3e-4 alone, the check measured only 6.6e-5.
+        with mock.patch.object(
+            ModernBertEncoderLayer, "__init__", hard_code_epsilon
+        ):
+            with self.assertRaisesRegex(
+                AssertionError, "\nepsilon: per-position error above 1e-04"
+            ):
+                self.run_reference_parity_test(
+                    model_type="modernbert",
+                    reference_class="ModernBertModel",
+                    config=MODERN_BERT_CONFIG,
+                    backbone_cls=ModernBertBackbone,
+                )
+
+    def test_epsilon_check_sees_an_epsilon_hard_coded_in_one_norm(self):
+        for module in ("torch", "transformers", "safetensors"):
+            pytest.importorskip(module)
+        init = ModernBertEncoderLayer.__init__
+
+        def hard_code_mlp_norm_epsilon(layer, *args, **kwargs):
+            init(layer, *args, **kwargs)
+            layer.mlp_norm.epsilon = 1e-5
+
+        # The weakest catch seen: only the norm in front of each MLP keeps
+        # 1e-5. Its output feeds the MLP, which the low_variance weights make
+        # second order, so the check measures 2.5e-4 at 3e-3 and under 5e-6
+        # at 3e-4. This keeps a change to EPSILONS from losing it silently.
+        with mock.patch.object(
+            ModernBertEncoderLayer, "__init__", hard_code_mlp_norm_epsilon
+        ):
+            with self.assertRaisesRegex(
+                AssertionError, "\nepsilon: per-position error above 1e-04"
+            ):
+                self.run_reference_parity_test(
+                    model_type="modernbert",
+                    reference_class="ModernBertModel",
+                    config=MODERN_BERT_CONFIG,
+                    backbone_cls=ModernBertBackbone,
+                )

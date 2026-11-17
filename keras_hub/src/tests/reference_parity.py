@@ -32,7 +32,8 @@ from keras_hub.src.utils.transformers import safetensor_utils
 # Largest per-position error of a correct port, relative to the scale of the
 # output (see `per_position_error`). Over the 18 families on three backends,
 # on macOS CPUs, the float32 noise of correct ports measured at most 1.1e-5
-# under revealing (Mixtral on TensorFlow). Against a float64 reference, the
+# under revealing (Mixtral on TensorFlow), 3.0e-6 under low_variance (Gemma)
+# and 1.5e-6 under epsilon (SmolLM3). Against a float64 reference, the
 # rounding errors of the two sides add up to at most 1.7e-5 under revealing
 # (Mixtral), so kernels that round as much keep a margin of 6 times. Qwen3
 # and XLM-RoBERTa measure 1.5e-5 and 1.1e-5 under revealing, but not from
@@ -42,8 +43,33 @@ PARITY_THRESHOLD = 1e-4
 # The negative control must move the outputs by more than this. The smallest
 # value measured over the parity tests of 18 families was 0.3.
 NEGATIVE_CONTROL_MIN_ERROR = 1e-2
-# The parity checks: "revealing" compares the outputs on the redrawn weights.
-CHECKS = ("revealing",)
+# "low_variance" scales every draw except those of normalization layers by
+# 0.01, which makes a wrong normalization epsilon visible.
+INITIALIZATIONS = ("revealing", "low_variance")
+# The parity checks: one per initialization, and "epsilon", which takes the
+# low_variance draws with every normalization epsilon field of the reference
+# config set to each value of EPSILONS in turn, and judges the larger error.
+# The low_variance check misses a converter that ignores an epsilon field
+# when the transformers default equals the keras-hub default; the epsilon
+# check does not.
+CHECKS = INITIALIZATIONS + ("epsilon",)
+# Set by the helper, never by a test. The epsilon check uses each in turn, as
+# no single value sees every wrong epsilon. Each is at least 30 times every
+# common default (1e-5, 1e-6, 1e-12). Measured over the 18 families on three
+# backends, an epsilon that the converter ignores moves the outputs by 3.2
+# (ALBERT) to 230, and a mapped one by at most 1.5e-6 (SmolLM3). The weak
+# cases are wrong epsilons in a single kind of norm, seeded:
+# - only in Qwen3's query and key norms: 1.1e-2 at 3e-4 but 4.2e-4 at 3e-3;
+# - only in ModernBERT's encoder layers: 6.6e-5 at 3e-4 but 6.2e-3 at 3e-3;
+# - only in the norm in front of a decoder's feed-forward block: 6.8e-4
+#   (Mixtral) to 5.2e-3 at either value;
+# - only in ModernBERT's MLP norms, the weakest catch seen: 1.7e-4 to 2.5e-4
+#   at 3e-3, under 5e-6 at 3e-4.
+# (3e-4, 1e-2) would catch that last case by 3.7 times instead of 1.7, and
+# correct ports would measure 1.9e-6; switching means re-measuring every
+# epsilon known failure, so revisit it with the threshold after the first
+# CI run on Linux.
+EPSILONS = (3e-4, 3e-3)
 # Where to look first when the outputs differ under a check.
 FAILURE_HINTS = {
     "revealing": (
@@ -52,7 +78,28 @@ FAILURE_HINTS = {
         "differs from transformers (an activation, an attention scale, mask "
         "or window, a position encoding)."
     ),
+    "low_variance": (
+        "Small weights, except in normalization layers: look for a "
+        "normalization epsilon."
+    ),
+    "epsilon": (
+        "The low_variance weights, with {fields} of the reference config set "
+        "to {epsilons}: look at how the converter maps {fields} to the "
+        "backbone, and for an epsilon hard-coded in the backbone or its "
+        "layers."
+    ),
 }
+# The hint of a low_variance failure when revealing fails too.
+BOTH_FAIL_HINT = (
+    "Revealing fails too: one bug usually fails both, so start there. If "
+    "the low_variance error is far larger, suspect a normalization epsilon."
+)
+# The hint of an epsilon failure when another check fails too.
+EPSILON_ALSO_HINT = (
+    "Another check fails too: one bug usually fails all of them, so start "
+    "there. If the epsilon error is far larger, look at how the converter "
+    "maps {fields}, and for a hard-coded epsilon."
+)
 # Length of the four input rows, long enough for every padding pattern.
 SEQUENCE_LENGTH = 17
 # Input ids are drawn from [MIN_TOKEN_ID, vocab_size), so that no special
@@ -72,7 +119,8 @@ MAX_ERROR_SLACK = 10
 
 # Reference config fields a parity test may set, by kind. Any other field (an
 # activation, a dropout, a bias switch, a rotary base) needs a maintainer to
-# classify it first, because changing it can hide a bug.
+# classify it first, because changing it can hide a bug. Epsilon fields are
+# set by the helper only, in the epsilon check.
 CONFIG_FIELDS = {
     "vocab_size": "vocabulary",
     "hidden_size": "width",
@@ -150,6 +198,11 @@ STATUS_TEXT = {
 }
 
 
+def format_epsilons():
+    """Formats `EPSILONS`, e.g. as `"3e-04, then to 3e-03"`."""
+    return ", then to ".join(f"{epsilon:.0e}" for epsilon in EPSILONS)
+
+
 def out_of_bounds(field, value):
     """Returns why `value` is out of bounds for `field`, or `None`."""
     kind = CONFIG_FIELDS[field]
@@ -170,7 +223,9 @@ def check_config(reference_class, config):
 
     The rules apply to the fields given and then to the values that the
     reference uses, which its config class may derive from them (such as
-    `head_dim` and `num_key_value_heads`).
+    `head_dim` and `num_key_value_heads`). Epsilon fields belong to the
+    epsilon check, and their defaults must be far from every value of
+    `EPSILONS`.
     """
     import transformers
 
@@ -179,8 +234,26 @@ def check_config(reference_class, config):
         return [f"`{reference_class}` is not a transformers class."]
     config_class = model_class.config_class
     defaults = config_class()
+    epsilons = epsilon_fields(defaults)
     problems = []
+    for path, (owner, name) in epsilons.items():
+        default = getattr(owner, name)
+        for epsilon in EPSILONS:
+            if epsilon / 10 < default < epsilon * 10:
+                # The check would barely see the field ignored.
+                problems.append(
+                    f"`{path}` defaults to {default:g}, within a factor of 10 "
+                    f"of {epsilon:.0e}, a value of the epsilon check; ask a "
+                    "maintainer to choose other EPSILONS."
+                )
     for field, value in config.items():
+        if field in epsilons:
+            problems.append(
+                f"`{field}` is set by the helper: the epsilon check sets "
+                "every normalization epsilon field to "
+                f"{format_epsilons()}. Remove it from `config`."
+            )
+            continue
         kind = CONFIG_FIELDS.get(field)
         if kind is None:
             problems.append(
@@ -311,28 +384,46 @@ def check_patterns(argument, patterns, names, excusable, nouns):
     return problems
 
 
-def apply_known_failures(comparisons, known_failures):
+def apply_known_failures(comparisons, known_failures, fields=()):
     """Judges the parity checks against the known failures of a test.
 
     `comparisons` maps each check that ran to the comparison of its
     outputs, and `known_failures` maps one to `(reason, max_error)`. A
     known failure is excused only while its largest error stays between
     `max_error / MAX_ERROR_SLACK` and `max_error`. This catches a new defect
-    larger than the known one, but not a smaller one.
+    larger than the known one, but not a smaller one. `fields` are the paths
+    of the normalization epsilon fields of the reference config, which the
+    epsilon check sets; without them, it does not run. That check is judged
+    on its largest error over all values of `EPSILONS`.
 
     Returns:
         A tuple `(failures, expected)` of lists of strings: the failures
-        that are not excused, including known failures that are gone, and
-        the excused known failures.
+        that are not excused, including known failures that are gone or
+        whose check cannot run, and the excused known failures.
     """
-    failures, expected = [], []
+    names = ", ".join(f"`{field}`" for field in fields)
+    failures, expected, failed = [], [], []
+    if "epsilon" in known_failures and comparisons and not fields:
+        failures.append(
+            "known failure `epsilon` is for a check that does not run, as the "
+            "reference config has no normalization epsilon field; remove it"
+        )
     for check in CHECKS:
         if check not in comparisons:
             continue
         failure = check_parity(comparisons[check])
         hint = FAILURE_HINTS[check]
+        if check == "low_variance" and "revealing" in failed:
+            hint = BOTH_FAIL_HINT
+        elif check == "epsilon" and failed:
+            hint = EPSILON_ALSO_HINT
+        if check == "epsilon":
+            hint = hint.format(fields=names, epsilons=format_epsilons())
+        elif check == "low_variance" and fields:
+            hint += f" Epsilon fields of the reference config: {names}."
         if check not in known_failures:
             if failure is not None:
+                failed.append(check)
                 failures.append(f"{check}: {failure}\n  {hint}")
             continue
         reason, max_error = known_failures[check]
@@ -343,6 +434,7 @@ def apply_known_failures(comparisons, known_failures):
                 f"known_failures (reason was: {reason})"
             )
         elif error > max_error:
+            failed.append(check)
             failures.append(
                 f"{check}: {failure}\n  This is above the max_error "
                 f"{max_error:g} of its known failure: a new defect, or the "
@@ -357,8 +449,11 @@ def apply_known_failures(comparisons, known_failures):
                 f"was: {reason})"
             )
         else:
+            label = check
+            if check == "epsilon":
+                label += f" ({', '.join(fields)} set to {format_epsilons()})"
             expected.append(
-                f"{check}: {reason}\n  measured: {failure} (max_error "
+                f"{label}: {reason}\n  measured: {failure} (max_error "
                 f"{max_error:g})"
             )
     return failures, expected
@@ -395,8 +490,8 @@ def marker_roles(model, directory):
     Every float parameter and persistent buffer is filled with its own
     integer code, the model is saved to `directory` and the codes are read
     back. Tied tensors share a storage and so a code. Returns a dict from
-    saved key to `(kind, attribute)`, with kind `"parameter"` or `"buffer"`,
-    or to `None` for an empty or integer tensor.
+    saved key to `(kind, module_class_name, attribute)`, with kind
+    `"parameter"` or `"buffer"`, or to `None` for an empty or integer tensor.
     """
     import torch
 
@@ -420,7 +515,7 @@ def marker_roles(model, directory):
                     continue
                 seen.add(tensor.data_ptr())
                 code = len(sources) + 1
-                sources[code] = (kind, name)
+                sources[code] = (kind, type(module).__name__, name)
                 originals.append((tensor, tensor.detach().clone()))
                 tensor.fill_(code)
         model.save_pretrained(directory)
@@ -441,14 +536,15 @@ def marker_roles(model, directory):
     return roles
 
 
-def redraw(path, roles):
+def redraw(path, roles, initialization):
     """Rewrites a safetensors file with keyed random values.
 
     Matrices get `min(0.6, 1.2 / sqrt(min(shape[0], shape[-1])))` times a
     unit draw. Vectors get their constructed value (if constant, else 0) plus
-    0.25 times a unit draw. Running statistics are redrawn; other buffers
-    are kept. The metadata, which holds the aliases of tied weights, is
-    kept.
+    0.25 times a unit draw. Under `"low_variance"` every draw is also scaled
+    by 0.01, except for the parameters of normalization layers. Running
+    statistics are redrawn; other buffers are kept. The metadata, which
+    holds the aliases of tied weights, is kept.
     """
     from safetensors.numpy import save_file
 
@@ -457,7 +553,7 @@ def redraw(path, roles):
         value, role = tensors[key], roles[key]
         if role is None:
             continue
-        kind, name = role
+        kind, module_class, name = role
         if kind == "buffer":
             if name == "running_var":
                 noise = unit_draw(SEED, key, value.shape) / np.sqrt(12.0)
@@ -467,7 +563,10 @@ def redraw(path, roles):
             else:
                 continue
         else:
-            noise = unit_draw(SEED, key, value.shape)
+            scale = 1.0
+            if initialization == "low_variance":
+                scale = 1.0 if "norm" in module_class.lower() else 0.01
+            noise = scale * unit_draw(SEED, key, value.shape)
             if value.ndim >= 2:
                 std = 1.2 / np.sqrt(min(value.shape[0], value.shape[-1]))
                 new_value = min(0.6, std) * noise
@@ -477,6 +576,29 @@ def redraw(path, roles):
                 new_value = (float(flat[0]) if constant else 0.0) + 0.25 * noise
         tensors[key] = np.asarray(new_value).astype(value.dtype)
     save_file(tensors, path, metadata=metadata)
+
+
+def epsilon_fields(config):
+    """Finds the normalization epsilon fields of a transformers config.
+
+    These are the float fields whose name contains "eps", in the config and
+    in its sub-configs.
+
+    Returns:
+        A dict from the path of each field, such as `"rms_norm_eps"` or
+        `"text_config.layer_norm_eps"`, to `(owner, name)`: the config or
+        sub-config that holds the field, and its name there.
+    """
+    import transformers
+
+    fields = {}
+    for name, value in sorted(vars(config).items()):
+        if isinstance(value, transformers.PretrainedConfig):
+            for path, field in epsilon_fields(value).items():
+                fields[f"{name}.{path}"] = field
+        elif isinstance(value, float) and "eps" in name.lower():
+            fields[name] = (config, name)
+    return fields
 
 
 @contextlib.contextmanager
@@ -513,18 +635,24 @@ def hidden_progress_bars():
             hub_utils.enable_progress_bars()
 
 
-def build_reference(reference_class, config, directory):
+def build_reference(
+    reference_class, config, directory, initialization, epsilon=None
+):
     """Saves a tiny reference model to `directory`; returns it reloaded.
 
-    The model is built from `config` and saved with `save_pretrained`. Its
-    weights are redrawn, and it is loaded again in float32 with the library
-    default attention implementation.
+    The model is built from `config`, with every normalization epsilon
+    field set to `epsilon` if given, and saved with `save_pretrained`. Its
+    weights are redrawn for `initialization`, and it is loaded again in
+    float32 with the library default attention implementation.
     """
     import torch
     import transformers
 
     model_class = getattr(transformers, reference_class)
     reference_config = model_class.config_class(**config)
+    if epsilon is not None:
+        for owner, name in epsilon_fields(reference_config).values():
+            setattr(owner, name, epsilon)
     torch.manual_seed(SEED)
     model = model_class(reference_config).eval()
     num_parameters = sum(p.numel() for p in model.parameters())
@@ -538,7 +666,7 @@ def build_reference(reference_class, config, directory):
         with tempfile.TemporaryDirectory() as scratch:
             roles = marker_roles(model, scratch)
         path = os.path.join(directory, "model.safetensors")
-        redraw(path, roles)
+        redraw(path, roles, initialization)
         model, info = model_class.from_pretrained(
             directory,
             dtype=torch.float32,
@@ -648,8 +776,9 @@ def per_position_error(keras_output, reference_output, padding_mask=None):
     At each position where `padding_mask` (shape `(batch, positions)`, if
     given) is not 0, the largest absolute difference is divided by the root
     mean square of the reference at that position, so that the error does
-    not depend on the scale of the output. Where the reference is zero, the
-    output must be zero too. The error is the largest of these values.
+    not depend on the scale of the output: the low_variance and epsilon
+    checks give small outputs. Where the reference is zero, the output must
+    be zero too. The error is the largest of these values.
 
     Returns:
         A tuple `(status, error)`: `status` is `"ok"`, `"shape"`,
@@ -1176,19 +1305,24 @@ def run_checks(
 
     The arguments are those of `TestCase.run_reference_parity_test`, and
     `directory` is an empty directory for the checkpoints. Returns a tuple
-    `(problems, comparisons, notes)`: the failures that no known
+    `(problems, comparisons, notes, fields)`: the failures that no known
     failure can excuse (a failed load, an unread tensor, an unassigned
     weight, a wrong test argument, test machinery that does not work), the
-    comparison of the outputs under each check that ran, and what was
-    measured.
+    comparison of the outputs under each check that ran, what was measured,
+    and the paths of the normalization epsilon fields of the reference
+    config. The epsilon check runs if there is one: it sets them all to each
+    value of `EPSILONS` in turn, and its comparison names the outputs with
+    the value, as in `"hidden (3e-04)"`.
     """
     problems, comparisons, notes = [], {}, []
-    # The checkpoints, each in a folder of the name of its check.
+    # The checkpoints, each in a folder of its name, as `{name: (check,
+    # initialization, epsilon)}`.
+    runs = {init: (init, init, None) for init in INITIALIZATIONS}
     references = {
-        check: build_reference(
-            reference_class, config, os.path.join(directory, check)
+        name: build_reference(
+            reference_class, config, os.path.join(directory, name), init
         )
-        for check in CHECKS
+        for name, (_, init, _) in runs.items()
     }
     saved_model_type = references["revealing"].config.model_type
     if saved_model_type != model_type:
@@ -1196,7 +1330,24 @@ def run_checks(
             f"`{reference_class}` saves model_type `{saved_model_type}`, not "
             f"`{model_type}`."
         )
-        return problems, comparisons, notes
+        return problems, comparisons, notes, []
+    fields = list(epsilon_fields(references["low_variance"].config))
+    if not fields:
+        notes.append(
+            "epsilon: not run, as the reference config has no normalization "
+            "epsilon field"
+        )
+    else:
+        for epsilon in EPSILONS:
+            name = f"epsilon_{epsilon:.0e}"
+            runs[name] = ("epsilon", "low_variance", epsilon)
+            references[name] = build_reference(
+                reference_class,
+                config,
+                os.path.join(directory, name),
+                "low_variance",
+                epsilon,
+            )
     token_ids, padding_mask = text_inputs(
         references["revealing"].config.vocab_size
     )
@@ -1208,21 +1359,31 @@ def run_checks(
     # Every Keras load and call runs on the CPU: on a GPU, JAX and
     # TensorFlow compute float32 matmuls in reduced precision by default.
     with keras.device("cpu"):
-        for check in CHECKS:
-            path = os.path.join(directory, check)
+        for name, (check, _, epsilon) in runs.items():
+            path = os.path.join(directory, name)
             backbone, task, audit, problem = audited_load(
                 path, backbone_cls, task_cls
             )
             if problem is not None:
                 problems.append(problem)
+                # A check is judged on all of its runs, or not at all.
+                comparisons.pop(check, None)
                 break
             model = backbone if task is None else task
             census = audit.finish(model)
             inputs = keras_inputs(backbone, token_ids, padding_mask)
-            reference = reference_outputs(references[check], inputs)
+            reference = reference_outputs(references[name], inputs)
             outputs = keras_outputs(backbone, task, inputs)
             comparison = compare_outputs(outputs, reference, padding_mask)
-            comparisons[check] = comparison
+            label = check
+            if epsilon is None:
+                comparisons[check] = comparison
+            else:
+                label += f" ({', '.join(fields)} set to {epsilon:.0e})"
+                comparisons.setdefault(check, {}).update(
+                    (f"{output} ({epsilon:.0e})", result)
+                    for output, result in comparison.items()
+                )
             if check == "revealing":
                 notes += describe_audit(audit)
                 problems += check_audit(
@@ -1241,14 +1402,16 @@ def run_checks(
                 never = census["never_assigned"]
                 suspects = describe_weights(never, model.weights)
                 revealing = (outputs, inputs, suspects)
-            notes.append(f"{check}: {format_comparison(comparison)}")
+            # Every run, passed or failed, so that the epsilon fields and
+            # values always show.
+            notes.append(f"{label}: {format_comparison(comparison)}")
             if not controlled and check_parity(comparison) is None:
                 # Once, under the first run whose parity passed.
                 controlled = True
                 error, control_problems = check_negative_control(
                     backbone, task, inputs, reference, padding_mask
                 )
-                notes.append(f"negative control under {check}: {error:.2g}")
+                notes.append(f"negative control under {label}: {error:.2g}")
                 problems += control_problems
         if revealing is not None:
             problems += check_uninstrumented(
@@ -1256,4 +1419,4 @@ def run_checks(
             )
     if revealing is not None and not controlled:
         notes.append("negative control: not run, as no parity check passed")
-    return problems, comparisons, notes
+    return problems, comparisons, notes, fields
