@@ -1361,6 +1361,70 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
             output = ops.argmax(output, axis=-1)
             self.assertAllEqual(output, expected_labels)
 
+    def run_reference_parity_test(
+        self,
+        model_type,
+        reference_class,
+        config,
+        backbone_cls,
+        task_cls=None,
+    ):
+        """Check a transformers converter against the transformers model.
+
+        A tiny `reference_class` model is built from `config`, its weights
+        are redrawn ("revealing"), and the checkpoint written by
+        `save_pretrained` is loaded with `from_preset` on the CPU. The test
+        checks that:
+
+        - `from_preset` succeeds and returns `backbone_cls` (and `task_cls`,
+          if given);
+        - every output (hidden states, pooled output, and the
+          logits of `task_cls`) differs from transformers by at most
+          `reference_parity.PARITY_THRESHOLD` times the root mean square of
+          the transformers output, at every valid position.
+
+        A negative control checks the test itself.
+
+        Args:
+            model_type: string. The `model_type` keras-hub dispatches on.
+            reference_class: string. The transformers class to save, e.g.
+                `"GPT2LMHeadModel"`.
+            config: dict. Small values for fields of the reference config.
+            backbone_cls: The keras-hub backbone class the load must return.
+            task_cls: Optional keras-hub task class to load through, whose
+                logits are then compared too.
+        """
+        import pytest
+
+        if keras.config.backend() == "openvino":
+            self.skipTest("Reference parity tests do not run on OpenVINO.")
+        for module in ("torch", "transformers", "safetensors"):
+            pytest.importorskip(module)
+        from keras_hub.src.tests import reference_parity
+
+        header = (
+            f"Reference parity of model_type `{model_type}` "
+            f"({reference_class} against "
+            f"{(task_cls or backbone_cls).__name__}):"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            problems, comparisons, notes = reference_parity.run_checks(
+                model_type,
+                reference_class,
+                config,
+                backbone_cls,
+                task_cls,
+                directory,
+            )
+        failures = reference_parity.judge_checks(comparisons)
+        measured = []
+        if notes:
+            measured = ["Measured:"] + [f"  {note}" for note in notes]
+        if problems or failures:
+            lines = [header] + problems + failures
+            self.fail("\n".join(lines + measured))
+
     def get_test_data_dir(self):
         return str(pathlib.Path(__file__).parent / "test_data")
 

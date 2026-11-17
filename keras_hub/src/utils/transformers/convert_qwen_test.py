@@ -2,6 +2,7 @@ import pytest
 
 from keras_hub.src.models.backbone import Backbone
 from keras_hub.src.models.qwen.qwen_backbone import QwenBackbone
+from keras_hub.src.models.qwen.qwen_causal_lm import QwenCausalLM
 from keras_hub.src.tests.test_case import TestCase
 from keras_hub.src.utils.transformers import convert_qwen
 
@@ -45,3 +46,20 @@ class TestQwenConverter(TestCase):
         transformers_config["rope_parameters"] = {"rope_theta": 20000.0}
         keras_config = convert_qwen.convert_backbone_config(transformers_config)
         self.assertEqual(keras_config["rope_max_wavelength"], 20000.0)
+
+    def test_reference_parity(self):
+        self.run_reference_parity_test(
+            model_type="qwen2",
+            reference_class="Qwen2ForCausalLM",
+            config={
+                "vocab_size": 211,
+                "hidden_size": 72,
+                "intermediate_size": 100,
+                "num_hidden_layers": 3,
+                "num_attention_heads": 6,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 64,
+            },
+            backbone_cls=QwenBackbone,
+            task_cls=QwenCausalLM,
+        )
