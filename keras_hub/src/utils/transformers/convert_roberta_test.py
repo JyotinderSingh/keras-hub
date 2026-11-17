@@ -31,3 +31,47 @@ class TestRobertaConverter(TestCase):
             load_weights=False,
         )
         self.assertIsInstance(model, RobertaBackbone)
+
+    def test_reference_parity(self):
+        token_type = (
+            "RobertaBackbone leaves out the token type embedding that "
+            "transformers adds at every position, which hides any other defect."
+        )
+        epsilon = (
+            "The missing token type embedding, and convert_roberta does not "
+            "map `layer_norm_eps`, which RobertaBackbone hard-codes as 1e-5."
+        )
+        self.run_reference_parity_test(
+            model_type="roberta",
+            reference_class="RobertaForMaskedLM",
+            config={
+                "vocab_size": 211,
+                "hidden_size": 48,
+                "num_hidden_layers": 3,
+                "num_attention_heads": 4,
+                "intermediate_size": 80,
+                "max_position_embeddings": 66,
+                "type_vocab_size": 1,
+                "pad_token_id": 1,
+            },
+            backbone_cls=RobertaBackbone,
+            ignored_reference_tensors={
+                "lm_head.*": (
+                    "The masked-LM head of RobertaForMaskedLM; "
+                    "RobertaBackbone has no head."
+                ),
+                "roberta.embeddings.token_type_embeddings.weight": (
+                    "convert_roberta never reads it, and RobertaBackbone has "
+                    "no token type embedding."
+                ),
+            },
+            # While the token type embedding is left out, every check
+            # measures 3 to 5, so none can detect a wiring bug: query and
+            # key biases swapped in every layer still give XFAIL. Only the
+            # load and its audit are tested.
+            known_failures={
+                "revealing": (token_type, 8.0),
+                "low_variance": (epsilon, 8.0),
+                "epsilon": (epsilon, 10),
+            },
+        )

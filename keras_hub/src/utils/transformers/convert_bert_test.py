@@ -42,4 +42,32 @@ class TestTask(TestCase):
         )
         self.assertIsInstance(model.preprocessor.tokenizer, XLMRobertaTokenizer)
 
-    # TODO: compare numerics with huggingface model.
+    def test_reference_parity(self):
+        self.run_reference_parity_test(
+            model_type="bert",
+            reference_class="BertModel",
+            config={
+                "vocab_size": 211,
+                "hidden_size": 48,
+                "num_hidden_layers": 3,
+                "num_attention_heads": 4,
+                "intermediate_size": 80,
+                "max_position_embeddings": 64,
+                "type_vocab_size": 2,
+                "pad_token_id": 0,
+            },
+            backbone_cls=BertBackbone,
+            known_failures={
+                "revealing": (
+                    "known difference from transformers: BERT uses the tanh "
+                    "GELU approximation of the original Google "
+                    "implementation (not a defect).",
+                    2.5e-3,
+                ),
+                "epsilon": (
+                    "convert_bert does not map `layer_norm_eps`, and "
+                    "BertBackbone hard-codes 1e-12.",
+                    10,
+                ),
+            },
+        )
