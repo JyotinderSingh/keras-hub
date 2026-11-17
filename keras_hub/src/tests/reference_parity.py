@@ -333,7 +333,9 @@ def check_known_failures(known_failures):
                 f"({', '.join(CHECKS)}). A stored tensor the converter does "
                 "not read goes in `ignored_reference_tensors`, and a weight "
                 "that the model computes from its config instead of loading "
-                "goes in `derived_weights`, each with the reason."
+                "goes in `derived_weights`, each with the reason; a model "
+                "that does not load goes in NOT_YET_COVERED of "
+                "reference_parity_coverage_test.py."
             )
         elif not (
             isinstance(value, tuple)
