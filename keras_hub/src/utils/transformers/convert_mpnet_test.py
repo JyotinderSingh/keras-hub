@@ -50,3 +50,26 @@ class TestTask(TestCase):
             self.assertEqual(
                 model.preprocessor.sequence_length, sequence_length
             )
+
+    def test_reference_parity(self):
+        self.run_reference_parity_test(
+            model_type="mpnet",
+            reference_class="MPNetModel",
+            config={
+                "vocab_size": 211,
+                "hidden_size": 48,
+                "num_hidden_layers": 3,
+                "num_attention_heads": 4,
+                "intermediate_size": 80,
+                "max_position_embeddings": 64,
+                "pad_token_id": 1,
+            },
+            cls=MPNetBackbone,
+            ignored_reference_tensors={
+                "pooler.dense.*": (
+                    "The pooler of MPNetModel. MPNetBackbone has no pooled "
+                    "output; MPNetTextEmbedder pools the sequence output, as "
+                    "sentence-transformers does."
+                ),
+            },
+        )

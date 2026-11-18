@@ -1369,13 +1369,17 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
         reference_class,
         cls,
         config,
+        ignored_reference_tensors=None,
+        derived_weights=None,
     ):
         """Check a transformers converter against the transformers model.
 
         A tiny `reference_class` model with random weights is saved with
         `save_pretrained`, loaded with `cls.from_preset` on the CPU and
-        compared with transformers. See the "Reference parity test" section
-        of CONTRIBUTING_MODELS.md.
+        compared with transformers. One more load is audited: the converter
+        must read every stored tensor and assign every Keras weight, except
+        those that `ignored_reference_tensors` and `derived_weights` name.
+        See the "Reference parity test" section of CONTRIBUTING_MODELS.md.
 
         Args:
             model_type: string. The `model_type` that keras-hub dispatches
@@ -1386,6 +1390,12 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
                 compared too, or a backbone.
             config: dict. Small values for the reference config fields that
                 a test may set; see `reference_parity.FIELDS`.
+            ignored_reference_tensors: Optional dict from an fnmatch pattern
+                on stored tensor keys to the reason the converter does not
+                read them.
+            derived_weights: Optional dict from an fnmatch pattern on Keras
+                weight paths to the reason the model computes them instead of
+                loading them.
         """
         reference_parity.run_reference_parity_test(
             self,
@@ -1393,6 +1403,8 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
             reference_class=reference_class,
             cls=cls,
             config=config,
+            ignored_reference_tensors=ignored_reference_tensors,
+            derived_weights=derived_weights,
         )
 
     def get_test_data_dir(self):

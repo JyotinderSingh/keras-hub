@@ -237,11 +237,13 @@ for masked language modeling (MLM) for DistilBERT.
 
 A converter in `keras_hub/src/utils/transformers/` for a text model should
 have a reference parity test. It saves a tiny transformers model with random
-weights, loads it with `from_preset`, and compares the outputs with
+weights, loads it with `from_preset`, checks that the converter reads every
+stored tensor and assigns every Keras weight, and compares the outputs with
 transformers.
 
 1. Copy the test of a similar model into `convert_xx_test.py`: qwen2 (below)
-   for a decoder, modernbert for an encoder loaded as a backbone.
+   for a decoder, distilbert for an encoder loaded as a backbone, smollm3
+   for a weight that the model computes.
 2. Set the arguments for your model (see the table below).
 3. Run the test on the three backends (see the end of this section).
 4. Fix what the message reports (see the labels below), until all three pass.
@@ -270,6 +272,8 @@ def test_reference_parity(self):
 | `reference_class` | The name of the transformers class to build. |
 | `cls` | The causal LM, whose logits are compared too, if `reference_class` has a language model head; else the backbone. Other tasks are not supported yet. |
 | `config` | Small values for the reference config fields in `FIELDS` of `keras_hub/src/tests/reference_parity.py`. Every value, defaults included, must stay within its `BOUNDS`. |
+| `ignored_reference_tensors` | `{fnmatch pattern: reason}` for stored tensors that the converter does not read, such as a head that `cls` does not have. |
+| `derived_weights` | `{fnmatch pattern: reason}` for Keras weights that the model computes from its config instead of loading. |
 
 Each `config` value must differ from its transformers default (special
 token ids excepted), so that the test shows that the converter reads it.
@@ -280,8 +284,9 @@ converter maps it in a unit test of `convert_backbone_config`, or add it to
 
 | Message label | What to do |
 | --- | --- |
-| `model_type:`, `reference_class:`, `cls:`, `config:` | An argument is wrong; fix it as the line says. |
+| `model_type:`, `reference_class:`, `cls:`, `config:`, `ignored_reference_tensors:`, `derived_weights:` | An argument is wrong; fix it as the line says. |
 | `load:` | Make `cls` the exact class that `from_preset` returns. For a causal LM, pick a `reference_class` with a language model head, or test the backbone. |
+| `unread:`, `unassigned:` | Port the listed tensors or weights, before you look at the checks: these often cause check failures. A head that `cls` does not have goes in `ignored_reference_tensors`, a weight computed from the config in `derived_weights`, with the reason. |
 | `full_weights:` | Random weights at full scale. Look for a swapped, transposed or mis-split tensor, layers in the wrong order, or a computation that differs from transformers. Fix it before the other checks. |
 | `small_weights:` | Small weights outside normalization layers, so that an epsilon matters. Look for a wrong normalization epsilon. |
 | `epsilon:` | Small weights, with every epsilon field of the config set by the helper. Look at how the converter maps the fields that the line names, and for an epsilon hard-coded in the backbone or its layers. |

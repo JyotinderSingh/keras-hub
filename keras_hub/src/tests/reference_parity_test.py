@@ -265,6 +265,11 @@ class ReferenceParityTest(TestCase):
             "reference_class: `NotAModel`",
         ),
         (
+            "exemption_without_reason",
+            {"ignored_reference_tensors": {"lm_head.*": ""}},
+            "ignored_reference_tensors: `lm_head.*`",
+        ),
+        (
             # Only causal LMs among tasks: other tasks take other inputs.
             "unsupported_cls",
             {"cls": ModernBertMaskedLM},
@@ -293,6 +298,42 @@ class ReferenceParityTest(TestCase):
             with self.assertRaises(AssertionError) as context:
                 self.run_reference_parity_test(**dict(GPT2, **arguments))
             self.assertIn("\n" + problem, str(context.exception))
+
+    def test_audit(self):
+        problems = reference_parity.check_patterns(
+            "ignored_reference_tensors",
+            ["pooler.*", "*.weight"],
+            ["h.0.weight", "lm_head.weight"],
+            ["lm_head.weight"],
+            "reads",
+        )
+        self.assertLen(problems, 2)
+        self.assertIn("`pooler.*` matches nothing", problems[0])
+        self.assertIn("`*.weight` also matches `h.0.weight`", problems[1])
+
+        port_weight = SafetensorLoader.port_weight
+
+        def skip_norm(loader, keras_variable, hf_weight_key, hook_fn=None):
+            if hf_weight_key not in ("ln_f.weight", "ln_f.bias"):
+                port_weight(loader, keras_variable, hf_weight_key, hook_fn)
+
+        with mock.patch.object(SafetensorLoader, "port_weight", skip_norm):
+            with self.assertRaises(AssertionError) as context:
+                self.run_reference_parity_test(
+                    **GPT2,
+                    ignored_reference_tensors={
+                        "transformer.ln_f.weight": "Seeded."
+                    },
+                    derived_weights={"layer_norm/gamma": "Seeded."},
+                )
+        # Each label lists only what no pattern excuses.
+        message = str(context.exception)
+        self.assertRegex(
+            message, r"\nunread: 1 of .*\n    transformer\.ln_f\.bias\n  Port"
+        )
+        self.assertRegex(
+            message, r"\nunassigned: 1 of .*\n    layer_norm/beta .*\n  Port"
+        )
 
     @parameterized.named_parameters(
         ("no_defect", QWEN2, None, set()),

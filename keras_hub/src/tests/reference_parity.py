@@ -7,21 +7,28 @@ saves it with `save_pretrained`, loads that checkpoint with keras-hub's
 valid position. It does this for each row of `RUNS`, each with its own
 checkpoint: full-size weights, small weights, and small weights with every
 normalization epsilon set by the helper. Each check fails when its largest
-error is above `THRESHOLD`.
+error is above `THRESHOLD`. One more load of the first checkpoint is audited:
+the converter must read every stored tensor and assign every Keras weight.
 
-A test supplies only a small config: the helper owns the inputs, the weights,
-the epsilon values and the threshold.
+A test supplies a small config, and names, each with a reason, the stored
+tensors the converter need not read and the weights the model computes instead
+of loading.
 
 The file reads top-down: the constants of the verdict, the entry point and its
 run loop, then one section per step: the argument rules, the reference model,
-the Keras model and the comparison. torch, transformers and safetensors are
-imported inside functions, so that importing this module needs none of them.
+the Keras model, the load audit and the comparison. torch, transformers and
+safetensors are imported inside functions, so that importing this module needs
+none of them.
 """
 
+import contextlib
+import fnmatch
 import hashlib
 import math
 import os
 import tempfile
+import types
+from unittest import mock
 
 import keras
 import numpy as np
@@ -30,6 +37,7 @@ import pytest
 from keras_hub.src.models.backbone import Backbone
 from keras_hub.src.models.causal_lm import CausalLM
 from keras_hub.src.utils import preset_utils
+from keras_hub.src.utils.transformers import safetensor_utils
 
 # A check fails when an output differs from transformers by more than this,
 # relative to the root mean square of the transformers output at the same
@@ -91,17 +99,23 @@ def run_reference_parity_test(
     reference_class,
     cls,
     config,
+    ignored_reference_tensors=None,
+    derived_weights=None,
 ):
     """Runs one parity test; see `TestCase.run_reference_parity_test`."""
     if keras.config.backend() == "openvino":
         testcase.skipTest("Reference parity tests do not run on OpenVINO.")
     for module in ("torch", "transformers", "safetensors"):
         pytest.importorskip(module)
+    ignored = ignored_reference_tensors or {}
+    derived = derived_weights or {}
     header = (
         f"Reference parity of model_type `{model_type}` ({reference_class} "
         f"against {getattr(cls, '__name__', cls)}):"
     )
-    problems = check_arguments(model_type, reference_class, cls, config)
+    problems = check_arguments(
+        model_type, reference_class, cls, config, ignored, derived
+    )
     if problems:
         testcase.fail("\n".join([header] + problems))
 
@@ -112,11 +126,15 @@ def run_reference_parity_test(
             reference_class=reference_class,
             cls=cls,
             config=config,
+            ignored=ignored,
+            derived=derived,
             fields=fields,
             directory=directory,
         )
     failures = judge(errors, fields)
     lines = [header] + problems
+    if problems and failures:
+        lines.append("Fix the problems above first; they often cause these:")
     lines += failures
     lines += ["Measured:"] + [f"  {note}" for note in notes]
     message = "\n".join(lines)
@@ -133,10 +151,12 @@ def run_checks(
     reference_class,
     cls,
     config,
+    ignored,
+    derived,
     fields,
     directory,
 ):
-    """Runs every row of `RUNS`.
+    """Runs every row of `RUNS`, and audits the load of the first.
 
     `fields` are the epsilon fields of the reference config; without them, the
     epsilon rows do not run.
@@ -144,8 +164,9 @@ def run_checks(
     Returns:
         A tuple `(errors, problems, notes)`. `errors` maps each check that
         ran to its largest error over its rows. `problems` fail the test: a
-        load that returned other classes, or a task with no logits to compare.
-        `notes` name the converter and give every row, for the message.
+        load that returned other classes, a task with no logits to compare,
+        and what the audit found. `notes` name the converter and give every
+        row, for the message.
     """
     errors, problems, notes = {}, [], []
     # Every Keras load and call runs on the CPU: on a GPU, JAX and TensorFlow
@@ -177,6 +198,7 @@ def run_checks(
                     )
                 if problems:
                     break
+                problems += audit(path, cls, checkpoint, ignored, derived)
             error, text = compare(
                 keras_outputs(backbone, task, inputs),
                 expected,
@@ -218,14 +240,18 @@ FIELDS = {
     "vocab_size": "vocabulary",
     "hidden_size": "size",
     "n_embd": "size",
+    "dim": "size",
     "intermediate_size": "size",
+    "hidden_dim": "size",
     "head_dim": "size",
     "moe_intermediate_size": "size",
     "shared_expert_intermediate_size": "size",
     "num_hidden_layers": "layers",
     "n_layer": "layers",
+    "n_layers": "layers",
     "num_attention_heads": "heads",
     "n_head": "heads",
+    "n_heads": "heads",
     "num_key_value_heads": "heads",
     "max_position_embeddings": "positions",
     "n_positions": "positions",
@@ -268,7 +294,7 @@ BOUNDS = {
 MAX_PARAMETERS = 5_000_000
 
 
-def check_arguments(model_type, reference_class, cls, config):
+def check_arguments(model_type, reference_class, cls, config, ignored, derived):
     """Returns the problems with the arguments of a test."""
     import transformers
 
@@ -294,6 +320,15 @@ def check_arguments(model_type, reference_class, cls, config):
             f"`{config_class.model_type}`, not `{model_type}`."
         )
     problems += check_config(config_class, config)
+    for argument, entries in (
+        ("ignored_reference_tensors", ignored),
+        ("derived_weights", derived),
+    ):
+        problems += [
+            f"{argument}: `{pattern}` needs a reason."
+            for pattern, reason in entries.items()
+            if not (isinstance(reason, str) and reason.strip())
+        ]
     return problems
 
 
@@ -629,6 +664,200 @@ def keras_outputs(backbone, task, inputs):
     if task is not None:
         outputs["logits"] = task(inputs)
     return {k: keras.ops.convert_to_numpy(v) for k, v in outputs.items()}
+
+
+# ---------------------------------------------------------------------------
+# The load audit: one more load of the first checkpoint, never compared.
+
+
+def audit(directory, cls, checkpoint, ignored, derived):
+    """Returns problem lines for what the converter does not read or assign.
+
+    The checkpoint is loaded once more under `recording`, which sets every
+    float Keras weight to NaN before the converter runs. A stored tensor is
+    unread if no conversion read it; a Keras weight is unassigned if it still
+    holds NaN, or was built after the conversion. The test's
+    `ignored_reference_tensors` and `derived_weights` excuse them; each of
+    their patterns must match something to excuse, and nothing else.
+    """
+    with recording(directory) as (reads, seen):
+        try:
+            backbone, task = load(directory, cls, f"{checkpoint}, audited")
+        except Exception as error:
+            error.add_note(
+                "Raised only under the load audit. Either the converter reads "
+                "a weight before it assigns it (the audit fills every weight "
+                "with NaN until then), or the audit failed: see the last "
+                "frame."
+            )
+            raise
+    weights = (backbone if task is None else task).weights
+    paths = [weight.path for weight in weights]
+    stored = stored_keys(directory)
+    unread = [key for key in stored if key not in reads]
+    unassigned = [w for w in weights if id(w) not in seen or holds_nan(w)]
+    pattern_problems = check_patterns(
+        "ignored_reference_tensors", ignored, stored, unread, "reads"
+    ) + check_patterns(
+        "derived_weights",
+        derived,
+        paths,
+        [w.path for w in unassigned],
+        "assigns",
+    )
+    unread = [key for key in unread if not matches(key, ignored)]
+    unassigned = [w for w in unassigned if not matches(w.path, derived)]
+    problems = []
+    if unread:
+        problems.append(
+            f"unread: {len(unread)} of {len(stored)} stored tensors were never "
+            f"read by {converter_name(directory)}:\n"
+            + listing(unread)
+            + "\n  Port them. A part the Keras class does not have, such as "
+            "a head, goes in `ignored_reference_tensors`, with the reason."
+        )
+    if unassigned:
+        # Paths can repeat; then the index in `weights` tells them apart.
+        index = {id(w): i for i, w in enumerate(weights)}
+        names = [
+            f"{w.path} {tuple(w.shape)}"
+            + (f" (weights[{index[id(w)]}])" if paths.count(w.path) > 1 else "")
+            for w in unassigned
+        ]
+        problems.append(
+            f"unassigned: {len(unassigned)} of {len(weights)} Keras weights "
+            f"were never assigned:\n{listing(names)}\n  Port them. A weight "
+            "the model computes from its config goes in `derived_weights`, "
+            "with the reason."
+        )
+    return problems + pattern_problems
+
+
+@contextlib.contextmanager
+def recording(directory):
+    """Records what a load of `directory` reads, and fills weights with NaN.
+
+    It patches two things, and undoes both on exit:
+    - the converter that `from_preset` picks for `directory`: each
+      `convert_weights` or `convert_head` call first sets every float weight
+      it has not seen yet to NaN;
+    - the `safetensors` module that `SafetensorLoader` uses: every tensor
+      read is recorded by its stored key.
+
+    Yields:
+        A tuple `(reads, seen)`: the set of stored keys read, and a dict from
+        `id()` to every weight that a conversion call saw. Keras variables
+        are not hashable, and holding them keeps their ids unique.
+    """
+    converter = preset_utils.get_preset_loader(directory).converter
+    reads, seen = set(), {}
+
+    def fill_then_convert(convert):
+        def wrapper(model, *args, **kwargs):
+            for weight in model.weights:
+                if id(weight) not in seen:
+                    seen[id(weight)] = weight
+                    if "float" in str(weight.dtype):
+                        weight.assign(np.full(weight.shape, np.nan, "float32"))
+            return convert(model, *args, **kwargs)
+
+        return wrapper
+
+    safetensors = safetensor_utils.safetensors
+
+    def safe_open(*args, **kwargs):
+        return RecordingFile(safetensors.safe_open(*args, **kwargs), reads)
+
+    with contextlib.ExitStack() as stack:
+        module = types.SimpleNamespace(**vars(safetensors))
+        module.safe_open = safe_open
+        stack.enter_context(
+            mock.patch.object(safetensor_utils, "safetensors", module)
+        )
+        for name in ("convert_weights", "convert_head"):
+            if hasattr(converter, name):
+                wrapper = fill_then_convert(getattr(converter, name))
+                stack.enter_context(mock.patch.object(converter, name, wrapper))
+        yield reads, seen
+
+
+class RecordingFile:
+    """An open safetensors file that records the key of every tensor read."""
+
+    def __init__(self, file, reads):
+        self.file = file
+        self.reads = reads
+
+    def __enter__(self):
+        # SafetensorLoader keeps what `__enter__` returns.
+        self.file.__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        return self.file.__exit__(*exc_info)
+
+    def __getattr__(self, name):
+        return getattr(self.file, name)
+
+    def get_tensor(self, key):
+        tensor = self.file.get_tensor(key)
+        self.reads.add(key)
+        return tensor
+
+
+def stored_keys(directory):
+    """Returns the keys of the tensors saved in `directory`."""
+    from safetensors import safe_open
+
+    keys = []
+    for name in sorted(os.listdir(directory)):
+        if name.endswith(".safetensors"):
+            path = os.path.join(directory, name)
+            with safe_open(path, framework="np") as file:
+                keys += list(file.keys())
+    return keys
+
+
+def holds_nan(weight):
+    """Whether a float Keras weight holds NaN."""
+    if "float" not in str(weight.dtype):
+        return False
+    return bool(np.isnan(keras.ops.convert_to_numpy(weight.value)).any())
+
+
+def matches(name, patterns):
+    """Whether `name` matches any of the fnmatch `patterns`."""
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+
+
+def check_patterns(argument, patterns, names, excusable, verb):
+    """Returns the problems with the patterns of an exemption argument.
+
+    Each pattern must match at least one name of `excusable`, and no other
+    name of `names`; `verb` says what the converter does with the others.
+    """
+    problems = []
+    for pattern in patterns:
+        matched = [name for name in names if fnmatch.fnmatchcase(name, pattern)]
+        used = [name for name in matched if name not in excusable]
+        if len(used) == len(matched):
+            problems.append(
+                f"{argument}: `{pattern}` matches nothing to excuse; remove it."
+            )
+        elif used:
+            problems.append(
+                f"{argument}: `{pattern}` also matches `{used[0]}`, which the "
+                f"converter {verb}; make it specific."
+            )
+    return problems
+
+
+def listing(items, limit=8):
+    """Lists items one per line, indented, at most `limit` of them."""
+    lines = [f"    {item}" for item in items[:limit]]
+    if len(items) > limit:
+        lines.append(f"    ... and {len(items) - limit} more")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
