@@ -243,7 +243,7 @@ transformers.
 
 1. Copy the test of a similar model into `convert_xx_test.py`: qwen2 (below)
    for a decoder, distilbert for an encoder loaded as a backbone, smollm3
-   for a weight that the model computes.
+   for a weight that the model computes. Never copy `known_failures`.
 2. Set the arguments for your model (see the table below).
 3. Run the test on the three backends (see the end of this section).
 4. Fix what the message reports (see the labels below), until all three pass.
@@ -274,6 +274,7 @@ def test_reference_parity(self):
 | `config` | Small values for the reference config fields in `FIELDS` of `keras_hub/src/tests/reference_parity.py`. Every value, defaults included, must stay within its `BOUNDS`. |
 | `ignored_reference_tensors` | `{fnmatch pattern: reason}` for stored tensors that the converter does not read, such as a head that `cls` does not have. |
 | `derived_weights` | `{fnmatch pattern: reason}` for Keras weights that the model computes from its config instead of loading. |
+| `known_failures` | `{check: (reason, error)}` for defects in a merged model; see below. |
 
 Each `config` value must differ from its transformers default (special
 token ids excepted), so that the test shows that the converter reads it.
@@ -284,12 +285,24 @@ converter maps it in a unit test of `convert_backbone_config`, or add it to
 
 | Message label | What to do |
 | --- | --- |
-| `model_type:`, `reference_class:`, `cls:`, `config:`, `ignored_reference_tensors:`, `derived_weights:` | An argument is wrong; fix it as the line says. |
+| `model_type:`, `reference_class:`, `cls:`, `config:`, `ignored_reference_tensors:`, `derived_weights:`, `known_failures:` | An argument is wrong; fix it as the line says. |
 | `load:` | Make `cls` the exact class that `from_preset` returns. For a causal LM, pick a `reference_class` with a language model head, or test the backbone. |
 | `unread:`, `unassigned:` | Port the listed tensors or weights, before you look at the checks: these often cause check failures. A head that `cls` does not have goes in `ignored_reference_tensors`, a weight computed from the config in `derived_weights`, with the reason. |
 | `full_weights:` | Random weights at full scale. Look for a swapped, transposed or mis-split tensor, layers in the wrong order, or a computation that differs from transformers. Fix it before the other checks. |
 | `small_weights:` | Small weights outside normalization layers, so that an epsilon matters. Look for a wrong normalization epsilon. |
 | `epsilon:` | Small weights, with every epsilon field of the config set by the helper. Look at how the converter maps the fields that the line names, and for an epsilon hard-coded in the backbone or its layers. |
+| `known failure <check>:` | Do what the line says: if the error grew, find the new defect and keep the recorded error; if it shrank, record the new error; if the check passes or did not run, remove the entry. |
+
+`known_failures` is for merged models only: a defect, or a deliberate
+difference from transformers such as BERT's tanh GELU. An entry maps a check
+to the reason, one sentence that names the file or field at fault, and the
+error that its failure line prints: for `full_weights: 3.7, above 1e-04`,
+record `3.7`. The test shows as XFAIL while the error stays between half and
+twice the recorded one. Above, there is a new defect or the known one grew:
+find it, and never raise the recorded error. Below, record the new one, and
+if part of a fix landed, rewrite the reason. When the check passes, remove
+the entry. A known failure excuses only its check, and hides any smaller
+defect in it: give each failing code path a test method of its own.
 
 The helper feeds text inputs only, so vision, audio, multimodal and
 encoder-decoder models have no parity test yet.

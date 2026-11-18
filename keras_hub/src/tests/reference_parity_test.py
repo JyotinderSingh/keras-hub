@@ -76,6 +76,8 @@ MODERN_BERT = {
     "config": MODERN_BERT_CONFIG,
 }
 MISTRAL = {"model_type": "mistral", "reference_class": "MistralForCausalLM"}
+REASON = "The converter rounds every weight."
+THRESHOLD = reference_parity.THRESHOLD
 
 
 def seed(defect):
@@ -265,6 +267,26 @@ class ReferenceParityTest(TestCase):
             "reference_class: `NotAModel`",
         ),
         (
+            "known_failure_not_a_check",
+            {"known_failures": {"unread": (REASON, 1.0)}},
+            "known_failures: `unread`",
+        ),
+        (
+            "recorded_at_threshold",
+            {"known_failures": {"epsilon": (REASON, THRESHOLD)}},
+            "known_failures: `epsilon`",
+        ),
+        (
+            "recorded_inf",
+            {"known_failures": {"epsilon": (REASON, math.inf)}},
+            "known_failures: `epsilon`",
+        ),
+        (
+            "known_failure_without_reason",
+            {"known_failures": {"epsilon": ("", 1.0)}},
+            "known_failures: `epsilon` needs",
+        ),
+        (
             "exemption_without_reason",
             {"ignored_reference_tensors": {"lm_head.*": ""}},
             "ignored_reference_tensors: `lm_head.*`",
@@ -287,6 +309,58 @@ class ReferenceParityTest(TestCase):
         lines = str(context.exception).splitlines()
         self.assertLen(lines, 2)
         self.assertStartsWith(lines[1], problem)
+
+    def run_with_errors(self, errors, problems=(), known=None):
+        outcome = (errors, list(problems), ["converter: convert_gpt2"])
+        with mock.patch.object(
+            reference_parity, "run_checks", return_value=outcome
+        ):
+            self.run_reference_parity_test(**GPT2, known_failures=known)
+
+    def test_known_failures_are_strict(self):
+        passing = {"full_weights": 1e-5, "small_weights": 1e-6, "epsilon": 1e-6}
+        failing = dict(passing, small_weights=1.3e-2)
+        known = {"small_weights": (REASON, 1e-2)}
+        self.run_with_errors(passing)
+        # Within the band, the test shows as XFAIL, with the reason.
+        # `pytest.xfail` is patched, so that this test passes under
+        # `pytest --runxfail` too.
+        xfailed = pytest.xfail.Exception
+        with mock.patch.object(pytest, "xfail", side_effect=xfailed) as xfail:
+            with self.assertRaises(xfailed):
+                self.run_with_errors(failing, known=known)
+        message = xfail.call_args.args[0]
+        self.assertIn("\nKnown failures:\n  small_weights: 0.013 now", message)
+        self.assertIn(REASON, message)
+        # `pytest --runxfail` makes `pytest.xfail` return: the test fails.
+        with mock.patch.object(pytest, "xfail") as xfail:
+            with self.assertRaisesRegex(AssertionError, "Known failures:"):
+                self.run_with_errors(failing, known=known)
+        xfail.assert_called_once()
+
+        # Anything else fails, and never shows as XFAIL.
+        grown = dict(passing, small_weights=0.05)
+        shrunk = dict(passing, small_weights=4e-3)
+        infinite = dict(passing, small_weights=math.inf)
+        not_run = {"full_weights": 1e-5, "small_weights": 1e-6}
+        with mock.patch.object(pytest, "xfail") as xfail:
+            for errors, known_failures, expected in (
+                (failing, None, "\nsmall_weights: 0.013, above"),
+                # A known failure excuses only its own check.
+                (dict(failing, full_weights=1.0), known, "\nfull_weights: 1,"),
+                (passing, known, "\nknown failure small_weights: no longer"),
+                (grown, known, "do not raise"),
+                (shrunk, known, "record 0.004"),
+                (infinite, known, "\nknown failure small_weights: inf"),
+                (not_run, {"epsilon": (REASON, 1.0)}, "did not run"),
+            ):
+                with self.assertRaises(AssertionError) as context:
+                    self.run_with_errors(errors, known=known_failures)
+                self.assertIn(expected, str(context.exception))
+            # Problems are never excused.
+            with self.assertRaisesRegex(AssertionError, "\nunread:"):
+                self.run_with_errors(failing, ["unread: lm_head.bias"], known)
+        xfail.assert_not_called()
 
     def test_routing_and_logits(self):
         for arguments, problem in (

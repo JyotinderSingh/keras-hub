@@ -11,8 +11,8 @@ error is above `THRESHOLD`. One more load of the first checkpoint is audited:
 the converter must read every stored tensor and assign every Keras weight.
 
 A test supplies a small config, and names, each with a reason, the stored
-tensors the converter need not read and the weights the model computes instead
-of loading.
+tensors the converter need not read, the weights the model computes instead of
+loading, and the known failures of a merged model.
 
 The file reads top-down: the constants of the verdict, the entry point and its
 run loop, then one section per step: the argument rules, the reference model,
@@ -70,7 +70,7 @@ RUNS = (
     ("epsilon", SMALL_WEIGHTS, 3e-4),
     ("epsilon", SMALL_WEIGHTS, 3e-3),
 )
-# The checks, in order.
+# The checks, in order; `known_failures` may name them.
 CHECKS = tuple(dict.fromkeys(check for check, _, _ in RUNS))
 
 # Where to look first when a check fails.
@@ -91,6 +91,11 @@ HINTS = {
     ),
 }
 
+# A known failure records the error that its check measures today. The test
+# shows as XFAIL while the error stays within this factor of it, above or
+# below.
+KNOWN_FAILURE_BAND = 2
+
 
 def run_reference_parity_test(
     testcase,
@@ -101,6 +106,7 @@ def run_reference_parity_test(
     config,
     ignored_reference_tensors=None,
     derived_weights=None,
+    known_failures=None,
 ):
     """Runs one parity test; see `TestCase.run_reference_parity_test`."""
     if keras.config.backend() == "openvino":
@@ -109,12 +115,13 @@ def run_reference_parity_test(
         pytest.importorskip(module)
     ignored = ignored_reference_tensors or {}
     derived = derived_weights or {}
+    known = known_failures or {}
     header = (
         f"Reference parity of model_type `{model_type}` ({reference_class} "
         f"against {getattr(cls, '__name__', cls)}):"
     )
     problems = check_arguments(
-        model_type, reference_class, cls, config, ignored, derived
+        model_type, reference_class, cls, config, ignored, derived, known
     )
     if problems:
         testcase.fail("\n".join([header] + problems))
@@ -131,14 +138,21 @@ def run_reference_parity_test(
             fields=fields,
             directory=directory,
         )
-    failures = judge(errors, fields)
+    failures, excused = judge(errors, known, fields)
     lines = [header] + problems
     if problems and failures:
         lines.append("Fix the problems above first; they often cause these:")
     lines += failures
+    if excused:
+        lines += ["Known failures:"] + excused
     lines += ["Measured:"] + [f"  {note}" for note in notes]
     message = "\n".join(lines)
     if problems or failures:
+        testcase.fail(message)
+    if excused:
+        pytest.xfail(message)
+        # Reached only under `pytest --runxfail`, which turns `xfail` into a
+        # no-op, so that known failures show as failures.
         testcase.fail(message)
     # A passing test raises nothing to carry its rows, so print them: the
     # threshold is calibrated from them.
@@ -163,10 +177,10 @@ def run_checks(
 
     Returns:
         A tuple `(errors, problems, notes)`. `errors` maps each check that
-        ran to its largest error over its rows. `problems` fail the test: a
-        load that returned other classes, a task with no logits to compare,
-        and what the audit found. `notes` name the converter and give every
-        row, for the message.
+        ran to its largest error over its rows. `problems` fail the test
+        whatever its known failures: a load that returned other classes, a
+        task with no logits to compare, and what the audit found. `notes`
+        name the converter and give every row, for the message.
     """
     errors, problems, notes = {}, [], []
     # Every Keras load and call runs on the CPU: on a GPU, JAX and TensorFlow
@@ -209,23 +223,60 @@ def run_checks(
     return errors, problems, notes
 
 
-def judge(errors, fields):
+def judge(errors, known_failures, fields):
     """Judges each check on its largest error.
 
     Returns:
-        The message lines of the checks that fail.
+        A tuple `(failures, excused)` of message lines: the failures that no
+        known failure excuses, and the known failures that still hold.
     """
-    failures = []
+    failures, excused = [], []
     for check in CHECKS:
+        entry = known_failures.get(check)
         if check not in errors:
+            # Only the epsilon check is ever skipped, when the config has no
+            # epsilon field. No check ran if the first run met a problem.
+            if entry and errors:
+                failures.append(
+                    f"known failure {check}: the check did not run, as the "
+                    "config has no normalization epsilon field; remove it."
+                )
             continue
         error = errors[check]
         hint = HINTS[check].format(fields=", ".join(f"`{f}`" for f in fields))
-        if error > THRESHOLD:
+        if entry is None:
+            if error > THRESHOLD:
+                failures.append(
+                    f"{check}: {error:.3g}, above {THRESHOLD:.0e}. {hint}"
+                )
+            continue
+        reason, recorded = entry
+        if error <= THRESHOLD:
             failures.append(
-                f"{check}: {error:.3g}, above {THRESHOLD:.0e}. {hint}"
+                f"known failure {check}: no longer happens ({error:.3g}); "
+                f"remove it. Its reason was: {reason}"
             )
-    return failures
+        elif error > recorded * KNOWN_FAILURE_BAND:
+            failures.append(
+                f"known failure {check}: {error:.3g} is more than "
+                f"{KNOWN_FAILURE_BAND} times the recorded {recorded:.3g}: a "
+                "new defect, or the known one grew. Find it; do not raise "
+                f"the recorded value. {hint} Its reason: {reason}"
+            )
+        elif error < recorded / KNOWN_FAILURE_BAND:
+            failures.append(
+                f"known failure {check}: {error:.3g} is less than "
+                f"1/{KNOWN_FAILURE_BAND} of the recorded {recorded:.3g}. If "
+                "part of a fix landed, what remains is another defect: "
+                f"rewrite the reason for it and record {error:.3g}. If the "
+                "weights were redrawn (a transformers upgrade can do that), "
+                f"record {error:.3g}. Its reason was: {reason}"
+            )
+        else:
+            excused.append(
+                f"  {check}: {error:.3g} now, recorded {recorded:.3g}: {reason}"
+            )
+    return failures, excused
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +292,7 @@ FIELDS = {
     "hidden_size": "size",
     "n_embd": "size",
     "dim": "size",
+    "embedding_size": "size",
     "intermediate_size": "size",
     "hidden_dim": "size",
     "head_dim": "size",
@@ -262,11 +314,15 @@ FIELDS = {
     "eos_token_id": "token_id",
     "cls_token_id": "token_id",
     "sep_token_id": "token_id",
+    "type_vocab_size": None,
+    "query_pre_attn_scalar": None,
     "global_attn_every_n_layers": None,
     "num_local_experts": None,
     "num_experts": None,
     "num_experts_per_tok": None,
     "decoder_sparse_step": None,
+    "num_hidden_groups": None,
+    "inner_group_num": None,
 }
 # Four rows of 17 tokens: long enough for right, left and interior padding.
 SEQUENCE_LENGTH = 17
@@ -294,7 +350,9 @@ BOUNDS = {
 MAX_PARAMETERS = 5_000_000
 
 
-def check_arguments(model_type, reference_class, cls, config, ignored, derived):
+def check_arguments(
+    model_type, reference_class, cls, config, ignored, derived, known
+):
     """Returns the problems with the arguments of a test."""
     import transformers
 
@@ -329,6 +387,27 @@ def check_arguments(model_type, reference_class, cls, config, ignored, derived):
             for pattern, reason in entries.items()
             if not (isinstance(reason, str) and reason.strip())
         ]
+    for check, entry in known.items():
+        if check not in CHECKS:
+            problems.append(
+                f"known_failures: `{check}` is not a check "
+                f"({', '.join(CHECKS)}). A stored tensor the converter does "
+                "not read goes in `ignored_reference_tensors`, a weight the "
+                "model computes from its config in `derived_weights`."
+            )
+        elif not (
+            isinstance(entry, tuple)
+            and len(entry) == 2
+            and isinstance(entry[0], str)
+            and entry[0].strip()
+            and isinstance(entry[1], (int, float))
+            and THRESHOLD < entry[1] < math.inf
+        ):
+            problems.append(
+                f"known_failures: `{check}` needs `(reason, error)`: what is "
+                "wrong, and the error the check measures today, a finite "
+                f"number above {THRESHOLD:.0e}."
+            )
     return problems
 
 

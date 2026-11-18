@@ -33,3 +33,36 @@ class TestTask(TestCase):
             load_weights=False,
         )
         self.assertIsInstance(model, XLMRobertaBackbone)
+
+    def test_reference_parity(self):
+        epsilon = (
+            "convert_xlm_roberta does not map `layer_norm_eps`, and "
+            "XLMRobertaBackbone inherits the 1e-5 that RobertaBackbone "
+            "hard-codes."
+        )
+        self.run_reference_parity_test(
+            model_type="xlm-roberta",
+            reference_class="XLMRobertaModel",
+            config={
+                "vocab_size": 211,
+                "hidden_size": 48,
+                "num_hidden_layers": 3,
+                "num_attention_heads": 4,
+                "intermediate_size": 80,
+                "max_position_embeddings": 66,
+                "type_vocab_size": 1,
+                "pad_token_id": 1,
+            },
+            cls=XLMRobertaBackbone,
+            ignored_reference_tensors={
+                "pooler.dense.*": (
+                    "The pooler of XLMRobertaModel. XLMRobertaBackbone has no "
+                    "pooled output, and no keras-hub XLM-RoBERTa task uses "
+                    "one."
+                ),
+            },
+            known_failures={
+                "small_weights": (epsilon, 8.0e-2),
+                "epsilon": (epsilon, 3.5),
+            },
+        )

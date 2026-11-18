@@ -1371,6 +1371,7 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
         config,
         ignored_reference_tensors=None,
         derived_weights=None,
+        known_failures=None,
     ):
         """Check a transformers converter against the transformers model.
 
@@ -1396,6 +1397,10 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
             derived_weights: Optional dict from an fnmatch pattern on Keras
                 weight paths to the reason the model computes them instead of
                 loading them.
+            known_failures: Optional dict from a check (`"full_weights"`,
+                `"small_weights"` or `"epsilon"`) to `(reason, error)`: a
+                defect in a merged model, or a deliberate difference from
+                transformers, and the error the check measures today.
         """
         reference_parity.run_reference_parity_test(
             self,
@@ -1405,6 +1410,7 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
             config=config,
             ignored_reference_tensors=ignored_reference_tensors,
             derived_weights=derived_weights,
+            known_failures=known_failures,
         )
 
     def get_test_data_dir(self):
