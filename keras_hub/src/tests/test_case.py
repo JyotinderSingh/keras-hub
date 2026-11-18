@@ -15,6 +15,7 @@ from keras import tree
 from keras.layers import ReversibleEmbedding
 
 from keras_hub.src.models.retinanet.feature_pyramid import FeaturePyramid
+from keras_hub.src.tests import reference_parity
 from keras_hub.src.tokenizers.tokenizer import Tokenizer
 from keras_hub.src.utils.tensor_utils import is_float_dtype
 
@@ -1360,6 +1361,39 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
         if expected_labels is not None:
             output = ops.argmax(output, axis=-1)
             self.assertAllEqual(output, expected_labels)
+
+    def run_reference_parity_test(
+        self,
+        *,
+        model_type,
+        reference_class,
+        cls,
+        config,
+    ):
+        """Check a transformers converter against the transformers model.
+
+        A tiny `reference_class` model with random weights is saved with
+        `save_pretrained`, loaded with `cls.from_preset` on the CPU and
+        compared with transformers. See the "Reference parity test" section
+        of CONTRIBUTING_MODELS.md.
+
+        Args:
+            model_type: string. The `model_type` that keras-hub dispatches
+                on, which `reference_class` must save.
+            reference_class: string. The transformers class to build, e.g.
+                `"Qwen2ForCausalLM"`.
+            cls: The keras-hub class to load: a causal LM, whose logits are
+                compared too, or a backbone.
+            config: dict. Small values for the reference config fields that
+                a test may set; see `reference_parity.FIELDS`.
+        """
+        reference_parity.run_reference_parity_test(
+            self,
+            model_type=model_type,
+            reference_class=reference_class,
+            cls=cls,
+            config=config,
+        )
 
     def get_test_data_dir(self):
         return str(pathlib.Path(__file__).parent / "test_data")

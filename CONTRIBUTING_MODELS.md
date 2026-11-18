@@ -233,6 +233,72 @@ a separate preprocessor class for every task. This is because different tasks
 might require different input formats. For instance, we have a [separate preprocessor](https://github.com/keras-team/keras-hub/blob/master/keras_hub/src/models/distil_bert/distil_bert_masked_lm_preprocessor.py)
 for masked language modeling (MLM) for DistilBERT.
 
+## Reference parity test
+
+A converter in `keras_hub/src/utils/transformers/` for a text model should
+have a reference parity test. It saves a tiny transformers model with random
+weights, loads it with `from_preset`, and compares the outputs with
+transformers.
+
+1. Copy the test of a similar model into `convert_xx_test.py`: qwen2 (below)
+   for a decoder, modernbert for an encoder loaded as a backbone.
+2. Set the arguments for your model (see the table below).
+3. Run the test on the three backends (see the end of this section).
+4. Fix what the message reports (see the labels below), until all three pass.
+
+```python
+def test_reference_parity(self):
+    self.run_reference_parity_test(
+        model_type="qwen2",
+        reference_class="Qwen2ForCausalLM",
+        config={
+            "vocab_size": 211,
+            "hidden_size": 72,
+            "intermediate_size": 100,
+            "num_hidden_layers": 3,
+            "num_attention_heads": 6,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 64,
+        },
+        cls=QwenCausalLM,
+    )
+```
+
+| Argument | What to pass |
+| --- | --- |
+| `model_type` | The `model_type` that the converter is dispatched on. |
+| `reference_class` | The name of the transformers class to build. |
+| `cls` | The causal LM, whose logits are compared too, if `reference_class` has a language model head; else the backbone. Other tasks are not supported yet. |
+| `config` | Small values for the reference config fields in `FIELDS` of `keras_hub/src/tests/reference_parity.py`. Every value, defaults included, must stay within its `BOUNDS`. |
+
+Each `config` value must differ from its transformers default (special
+token ids excepted), so that the test shows that the converter reads it.
+Pick structural values that make every code path run. A field outside
+`FIELDS` keeps its default (the helper sets the epsilon fields): test how the
+converter maps it in a unit test of `convert_backbone_config`, or add it to
+`FIELDS` in your PR and say why, for a maintainer to review.
+
+| Message label | What to do |
+| --- | --- |
+| `model_type:`, `reference_class:`, `cls:`, `config:` | An argument is wrong; fix it as the line says. |
+| `load:` | Make `cls` the exact class that `from_preset` returns. For a causal LM, pick a `reference_class` with a language model head, or test the backbone. |
+| `full_weights:` | Random weights at full scale. Look for a swapped, transposed or mis-split tensor, layers in the wrong order, or a computation that differs from transformers. Fix it before the other checks. |
+| `small_weights:` | Small weights outside normalization layers, so that an epsilon matters. Look for a wrong normalization epsilon. |
+| `epsilon:` | Small weights, with every epsilon field of the config set by the helper. Look at how the converter maps the fields that the line names, and for an epsilon hard-coded in the backbone or its layers. |
+
+The helper feeds text inputs only, so vision, audio, multimodal and
+encoder-decoder models have no parity test yet.
+
+Fix the converter or the model, never the helper, its bounds or its
+threshold. The test is skipped on OpenVINO and without torch, transformers
+or safetensors; a skip is not a pass. Run it on all three backends:
+
+```shell
+for backend in jax tensorflow torch; do
+    KERAS_BACKEND=$backend pytest keras_hub/src/utils/transformers/convert_xx_test.py -k reference_parity
+done
+```
+
 ## Conclusion
 
 Once all three PRs (and optionally, the fourth PR) have been merged, you have
