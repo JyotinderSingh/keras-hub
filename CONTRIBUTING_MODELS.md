@@ -36,6 +36,7 @@ Keep this checklist handy!
 
 - [ ] An `xx/xx_presets.py` file with links to weights uploaded to a personal GCP bucket/Google Drive \[[Example](https://github.com/keras-team/keras-hub/blob/master/keras_hub/src/models/distil_bert/distil_bert_presets.py)\].
 - [ ] A `tools/checkpoint_conversion/convert_xx_checkpoints.py` which is reusable script for converting checkpoints \[[Example](https://github.com/keras-team/keras-hub/blob/master/tools/checkpoint_conversion/convert_distilbert_checkpoints.py)\].
+- [ ] If the model loads transformers checkpoints, a `test_reference_parity` method in `keras_hub/src/utils/transformers/convert_xx_test.py` that passes on JAX, TensorFlow and torch, or, for a model whose inputs the helper cannot feed yet, an entry in `NOT_YET_COVERED` of `keras_hub/src/utils/transformers/reference_parity_coverage_test.py` with the reason \[[Guide](#reference-parity-test)\].
 - [ ] A Colab notebook link in the PR description, showing an end-to-end task such as text classification, etc. The task model can be built using the backbone model, with the task head on top \[[Example](https://gist.github.com/mattdangerw/bf0ca07fb66b6738150c8b56ee5bab4e)\].
 
 ### Step 5: PR #4 and Beyond - Add XX Tasks and Preprocessors
@@ -235,11 +236,10 @@ for masked language modeling (MLM) for DistilBERT.
 
 ## Reference parity test
 
-A converter in `keras_hub/src/utils/transformers/` for a text model should
-have a reference parity test. It saves a tiny transformers model with random
-weights, loads it with `from_preset`, checks that the converter reads every
-stored tensor and assigns every Keras weight, and compares the outputs with
-transformers.
+Every converter in `keras_hub/src/utils/transformers/` needs a reference
+parity test. It saves a tiny transformers model with random weights, loads
+it with `from_preset`, checks that the converter reads every stored tensor
+and assigns every Keras weight, and compares the outputs with transformers.
 
 1. Copy the test of a similar model into `convert_xx_test.py`: qwen2 (below)
    for a decoder, distilbert for an encoder loaded as a backbone, smollm3
@@ -268,7 +268,7 @@ def test_reference_parity(self):
 
 | Argument | What to pass |
 | --- | --- |
-| `model_type` | The `model_type` that the converter is dispatched on. |
+| `model_type` | The `model_type` that the converter is dispatched on, as a string literal. |
 | `reference_class` | The name of the transformers class to build. |
 | `cls` | The causal LM, whose logits are compared too, if `reference_class` has a language model head; else the backbone. Other tasks are not supported yet. |
 | `config` | Small values for the reference config fields in `FIELDS` of `keras_hub/src/tests/reference_parity.py`. Every value, defaults included, must stay within its `BOUNDS`. |
@@ -304,8 +304,14 @@ if part of a fix landed, rewrite the reason. When the check passes, remove
 the entry. A known failure excuses only its check, and hides any smaller
 defect in it: give each failing code path a test method of its own.
 
-The helper feeds text inputs only, so vision, audio, multimodal and
-encoder-decoder models have no parity test yet.
+The helper feeds text inputs only. List the `model_type` of a vision, audio,
+multimodal, encoder-decoder or drafter model, or of a merged model whose
+checkpoint does not load, in `NOT_YET_COVERED` of
+`reference_parity_coverage_test.py`, with the reason. That test fails when a
+dispatched `model_type` has no parity test and no entry. Keep the call the
+last statement of a `test...` method of a module-level `TestCase` class, after
+at most a docstring and assignments of string constants, with no decorator,
+skip or `pytestmark`: a parity test runs on every pull request.
 
 Fix the converter or the model, never the helper, its bounds or its
 threshold. The test is skipped on OpenVINO and without torch, transformers

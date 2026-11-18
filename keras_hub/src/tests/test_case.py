@@ -1383,8 +1383,10 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
         See the "Reference parity test" section of CONTRIBUTING_MODELS.md.
 
         Args:
-            model_type: string. The `model_type` that keras-hub dispatches
-                on, which `reference_class` must save.
+            model_type: string literal, so that
+                `reference_parity_coverage_test.py` can find the test. The
+                `model_type` that keras-hub dispatches on, which
+                `reference_class` must save.
             reference_class: string. The transformers class to build, e.g.
                 `"Qwen2ForCausalLM"`.
             cls: The keras-hub class to load: a causal LM, whose logits are
